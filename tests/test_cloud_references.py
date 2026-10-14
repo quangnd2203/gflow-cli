@@ -56,7 +56,10 @@ def test_rejects_traversal_keys(uri: str) -> None:
 @pytest.mark.asyncio
 async def test_download_fails_closed_without_storage_uri_before_read(tmp_path: Path) -> None:
     with (
-        patch("gflow_cli.cloud_references.upath_from_uri") as upath_from_uri,
+        patch(
+            "gflow_cli.cloud_references.upath_from_uri",
+            side_effect=AssertionError("S3 read attempted before storage validation"),
+        ) as upath_from_uri,
         pytest.raises(CloudReferenceError),
     ):
         await download_cloud_reference_images(
