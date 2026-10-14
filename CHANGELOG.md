@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP generation results include cloud storage URIs.** Completed image and video
+  responses now return `cloud_uris` from the asset catalog alongside local `files`.
 - **`gflow image t2i --project-name` titles a multi-prompt run's project (#975).** With
   several prompts (positional, `--prompts-file` or `--stdin`) the option was accepted and
   then dropped: the shared project was always titled `gflow-cli t2i`. It now gets the name

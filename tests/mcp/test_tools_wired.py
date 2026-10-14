@@ -647,6 +647,7 @@ class TestRunGenerationTask:
         assert result["status"] == "completed"
         assert "task_id" in result
         assert "flow_media_id" in result
+        assert result["cloud_uris"] == []
 
     @pytest.mark.asyncio
     async def test_envelope_returns_media_id_not_workflow_id(
@@ -688,6 +689,58 @@ class TestRunGenerationTask:
         # The fake asset has flow_media_id="media-img-wired", flow_workflow_id="workflow-123".
         assert result["flow_media_id"] == "media-img-wired"
         assert result["flow_workflow_id"] == "workflow-123"
+
+    @pytest.mark.asyncio
+    async def test_envelope_returns_cloud_uris_from_asset_local_files(
+        self, temp_db: DataStore, tmp_path: Path
+    ) -> None:
+        """Cloud storage URIs are returned alongside local file paths."""
+        from types import SimpleNamespace
+
+        from gflow_cli.mcp.tools import _run_generation_task
+
+        asset = SimpleNamespace(
+            flow_project_id="proj-abc",
+            flow_workflow_id="workflow-123",
+            local_files=[
+                SimpleNamespace(path=tmp_path / "image.png", cloud_uri=None),
+                SimpleNamespace(path=None, cloud_uri="s3://gflow/images/image.png"),
+            ],
+        )
+
+        with (
+            patch(
+                "gflow_cli.worker.daemon.FlowApiClient",
+                return_value=_FakeFlowApiClient(),
+            ),
+            patch(
+                "gflow_cli.mcp.tools.get_settings",
+                return_value=MagicMock(
+                    resolved_db_path=lambda: temp_db.path,
+                    profile_subdir=lambda _: tmp_path / "profile_default",
+                ),
+            ),
+            patch(
+                "gflow_cli.worker.daemon.get_settings",
+                return_value=MagicMock(
+                    profile_subdir=lambda _: tmp_path / "profile_default",
+                    headless=True,
+                    transport=None,
+                    output_dir=tmp_path / "out",
+                ),
+            ),
+            patch("gflow_cli.mcp.tools.DataRepository") as repository,
+        ):
+            repository.return_value.get_asset_by_flow_media_id.return_value = asset
+            result = await _run_generation_task(
+                profile="default",
+                task_type="t2i",
+                payload={"prompt": "cloud URI response", "aspect": "1:1", "count": 1},
+            )
+
+        assert result["status"] == "completed"
+        assert result["files"] == [str(tmp_path / "image.png")]
+        assert result["cloud_uris"] == ["s3://gflow/images/image.png"]
 
     @pytest.mark.asyncio
     async def test_unknown_error_returns_error_status(

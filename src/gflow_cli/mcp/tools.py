@@ -428,6 +428,7 @@ async def _run_generation_task(
 
             # Resolve local file paths from the asset catalog.
             file_paths: list[str] = []
+            cloud_uris: list[str] = []
             flow_project_id: str | None = None
             flow_workflow_id: str | None = None
             if completed_task.flow_media_id:
@@ -441,6 +442,9 @@ async def _run_generation_task(
                     if asset.local_files:
                         file_paths = [
                             str(lf.path) for lf in asset.local_files if lf.path is not None
+                        ]
+                        cloud_uris = [
+                            lf.cloud_uri for lf in asset.local_files if lf.cloud_uri is not None
                         ]
 
         log.info(
@@ -458,6 +462,7 @@ async def _run_generation_task(
             "flow_media_id": completed_task.flow_media_id,
             "flow_workflow_id": flow_workflow_id,
             "files": file_paths,
+            "cloud_uris": cloud_uris,
         }
 
     except GFlowError as exc:
