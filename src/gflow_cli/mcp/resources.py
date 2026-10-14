@@ -79,6 +79,10 @@ Generate images using Google's Imagen model.
 - **Models:** nano2 (fastest), nano-pro (balanced), image4 (highest quality)
 - **Aspects:** 1:1, 9:16, 16:9, 4:3, 3:4
 - **Count:** 1-4 images per call
+- **References:** `reference_images` accepts local paths or Flow image UUIDs;
+  `cloud_reference_images` accepts S3 URIs from the bucket in
+  `GFLOW_CLI_STORAGE_URI`. Cloud objects are read by the worker at execution,
+  limited to 20 MiB, and uploaded as local reference files.
 
 ### gflow_generate_video
 Generate videos using Google's Veo model.

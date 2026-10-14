@@ -81,6 +81,11 @@ def _make_upath(uri: str) -> Path:
     return UPath(uri)  # type: ignore[return-value]
 
 
+def upath_from_uri(uri: str) -> Path:
+    """Construct a UPath for a complete cloud object URI."""
+    return _make_upath(uri)
+
+
 def _write_local(path: Path, data: bytes) -> None:
     """Synchronous helper: mkdir + write_bytes for local paths."""
     path.parent.mkdir(parents=True, exist_ok=True)

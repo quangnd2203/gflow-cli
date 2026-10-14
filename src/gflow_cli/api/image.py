@@ -420,7 +420,9 @@ class ProjectBrief:
 class GenerateImageRequest:
     """Inputs for ONE image generation.
 
-    T2I when ``refs`` is empty, I2I otherwise. Quantity > 1 is the caller's
+    T2I when no image/entity references are present, I2I otherwise. Queue-only
+    S3 references are materialized into ``ref_paths`` by the worker before a
+    transport receives this request. Quantity > 1 is the caller's
     responsibility — fan out into N parallel calls sharing a batch_id.
 
     ``recaptcha_token`` is populated by the caller right before send via
@@ -438,6 +440,9 @@ class GenerateImageRequest:
     # dialog by the ui_automation transport (the REST uploadImage path 401s).
     # The common i2i case; `refs` (pre-uploaded UUIDs) would need library-select.
     ref_paths: tuple[Path, ...] = ()
+    # Queue-only S3 URIs. FlowWorker counts these before download, then replaces
+    # them with `ref_paths` before calling any transport.
+    cloud_reference_images: tuple[str, ...] = ()
     # Flow CHARACTER entity ids to reference (project-scoped, attached via the
     # Add-Media → Personagens picker by the ui_automation transport). Entities
     # keep generated subjects consistent with a locked character. They count
@@ -468,7 +473,12 @@ class GenerateImageRequest:
         if not 1 <= self.count <= 4:
             msg = f"GenerateImageRequest.count must be 1–4, got {self.count}"
             raise ValueError(msg)
-        n_refs = len(self.refs) + len(self.ref_paths) + len(self.reference_entities)
+        n_refs = (
+            len(self.refs)
+            + len(self.ref_paths)
+            + len(self.cloud_reference_images)
+            + len(self.reference_entities)
+        )
         cap = reference_cap_for(self.model)
         if n_refs > cap:
             msg = f"{self.model.value} allows at most {cap} reference(s); got {n_refs}"

@@ -74,6 +74,33 @@ export AWS_DEFAULT_REGION=us-east-1
 The S3 backend uses standard AWS SDK environment variables. Omit
 `AWS_ENDPOINT_URL` for real AWS S3.
 
+### S3 image references from MCP
+
+`gflow_generate_image` also accepts `cloud_reference_images` for image-to-image
+requests. Install the S3 extra and configure the same bucket through
+`GFLOW_CLI_STORAGE_URI`; input objects may live under another key prefix in that
+bucket. Only that configured bucket is accepted. The worker reads references
+when it claims the queued task, so `wait=false` does not download objects in the
+MCP request handler. It uses the AWS credential and endpoint configuration
+already supplied to the process.
+
+Each image is limited to 20 MiB and must contain PNG, JPEG, WebP, or GIF magic
+bytes. Temporary files live only for the worker task and are removed after the
+Flow upload/generation path exits. The queue database stores the S3 URI while a
+task is pending or processing; keep the local database protected if object keys
+are sensitive.
+
+```json
+{
+  "prompt": "Use the first reference as the character and the second as the outfit",
+  "cloud_reference_images": [
+    "s3://my-bucket/cache/character.png",
+    "s3://my-bucket/cache/outfit.png"
+  ],
+  "wait": true
+}
+```
+
 ## Google Cloud Storage
 
 ```bash

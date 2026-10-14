@@ -41,6 +41,7 @@ from gflow_cli.api.video import VIDEO_DURATION_CHOICES, is_media_uuid
 from gflow_cli.auth import verification
 from gflow_cli.cli_image import lookup_project_in_catalog
 from gflow_cli.cli_instructions import classify_refs
+from gflow_cli.cloud_references import validate_cloud_reference_uris
 from gflow_cli.config import UiMode, get_settings
 from gflow_cli.data.models import AssetKind, AssetLookup
 from gflow_cli.data.queries import list_projects
@@ -770,11 +771,13 @@ def _build_video_media_inputs(
         "The prompt supports @AssetName mentions to tag saved project characters/assets by name "
         "(resolves to referenceEntities/referenceImages). Reference a SAVED named asset via "
         "@Name; reference an arbitrary one-off image via reference_images. See "
-        "docs/REFERENCE_STRATEGIES.md. "
+        "Use cloud_reference_images for S3 objects in the bucket configured by "
+        "GFLOW_CLI_STORAGE_URI; the worker reads those objects when it executes the task. "
+        "See docs/REFERENCE_STRATEGIES.md. "
         "On accounts served from flow.google.com, use an existing project and local "
         "reference files; UUID/entity references and image4 are not ported to that "
         "composer yet and fail before submit; retrying will not clear it. "
-        "Returns local file paths to the generated images."
+        "Returns local file paths and configured cloud output URIs for generated images."
     ),
 )
 @_guarded
@@ -785,6 +788,7 @@ async def gflow_generate_image(
     count: int = 1,
     seed: int | None = None,
     reference_images: list[str] | None = None,
+    cloud_reference_images: list[str] | None = None,
     reference_entities: list[str] | None = None,
     reference_entity_names: list[str] | None = None,
     tools: list[dict[str, Any]] | None = None,
@@ -810,6 +814,10 @@ async def gflow_generate_image(
         seed: Optional random seed for reproducibility.
         reference_images: Optional list of reference images for image-to-image generation.
             Can be local file paths or UUIDs of previously uploaded assets.
+        cloud_reference_images: Optional S3 object URIs for image-to-image generation.
+            The bucket must match the S3 bucket in GFLOW_CLI_STORAGE_URI. The worker reads
+            these queued URIs just before generation; local paths in reference_images
+            precede these cloud paths. Flow UUIDs keep their existing picker handling.
         reference_entities: Saved Flow CHARACTER entity **ids** to attach
             (mirrors the CLI ``--reference-entity``). Same wire as an ``@Name``
             mention (``referenceEntities``) and dedupes against it; use ids when
@@ -913,6 +921,16 @@ async def gflow_generate_image(
         payload["reference_entity_names"] = list(reference_entity_names)
 
     task_type = "t2i"
+    if cloud_reference_images:
+        try:
+            cloud_refs = validate_cloud_reference_uris(
+                cloud_reference_images, storage_uri=get_settings().storage_uri
+            )
+        except GFlowError as exc:
+            return _bad_param("Invalid Cloud Reference", exc.detail)
+        payload["cloud_reference_images"] = list(cloud_refs)
+        task_type = "i2i"
+
     if reference_images:
         ref_data, err = _resolve_image_references(reference_images)
         if err is not None:

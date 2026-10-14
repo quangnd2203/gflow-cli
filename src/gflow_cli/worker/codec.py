@@ -35,9 +35,10 @@ from gflow_cli.api.video import Aspect as VideoAspect
 from gflow_cli.api.video import GenerateVideoRequest, VideoModel
 from gflow_cli.api.video import Mode as VideoMode
 from gflow_cli.api.video import Tier as VideoTier
+from gflow_cli.cloud_references import validate_cloud_reference_uris
 from gflow_cli.config import UiMode
 from gflow_cli.data.redaction import redact_error_detail
-from gflow_cli.errors import QueueSchemaError
+from gflow_cli.errors import CloudReferenceError, QueueSchemaError
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -198,6 +199,12 @@ def build_image_request(payload: dict[str, Any]) -> GenerateImageRequest:
         for r in payload.get("refs", [])
     )
     ref_paths = tuple(Path(p) for p in payload.get("ref_paths", []))
+    try:
+        cloud_reference_images = validate_cloud_reference_uris(
+            payload.get("cloud_reference_images", [])
+        )
+    except CloudReferenceError as exc:
+        raise ValueError(exc.detail) from None
     # NOTE: the payload may carry "ref_names" (the MCP layer resolves them
     # for the video request); the image transport attaches remote refs by
     # media id, so GenerateImageRequest has no ref_names field and must
@@ -212,6 +219,7 @@ def build_image_request(payload: dict[str, Any]) -> GenerateImageRequest:
         model=model,
         refs=refs,
         ref_paths=ref_paths,
+        cloud_reference_images=cloud_reference_images,
         reference_entities=reference_entities,
         reference_entity_names=reference_entity_names,
         count=count,

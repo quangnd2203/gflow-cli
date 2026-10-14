@@ -1265,6 +1265,16 @@ class DataStoreError(GFlowError):
     _default_remediation = "Check database file permissions or run 'gflow data errors prune'"
 
 
+class CloudReferenceError(DataStoreError):
+    """Raised when a queued cloud reference cannot be safely materialized."""
+
+    problem_type = "https://gflow-cli.dev/errors/cloud-reference"
+    title = "Cloud reference image error"
+    _default_remediation = (
+        "Check the configured S3 bucket, object, image format, and read permissions."
+    )
+
+
 class DataMigrationError(DataStoreError):
     """Raised when local SQLite schema migration cannot proceed safely."""
 

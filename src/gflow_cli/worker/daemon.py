@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,6 +14,7 @@ from gflow_cli.api.client import FlowApiClient
 from gflow_cli.api.dto import GenerationCheckpoint, ProjectInfo
 from gflow_cli.api.image import GenerateImageRequest
 from gflow_cli.api.video import GenerateVideoRequest, VideoStarted
+from gflow_cli.cloud_references import download_cloud_reference_images
 from gflow_cli.config import get_settings
 from gflow_cli.data.models import OperationKind
 from gflow_cli.data.recorder import (
@@ -165,6 +168,7 @@ class FlowWorker:
         req: GenerateImageRequest | GenerateVideoRequest | None = None
         recorder: OperationRecorder | None = None
         started_media_ids: list[str] = []
+        cloud_reference_temp: tempfile.TemporaryDirectory[str] | None = None
 
         try:
             if task.task_type in ("t2i", "i2i"):
@@ -173,6 +177,20 @@ class FlowWorker:
                     if task.decoded is not None
                     else self._build_image_request(task.payload)
                 )
+                if req.cloud_reference_images:
+                    cloud_reference_temp = tempfile.TemporaryDirectory(
+                        prefix="gflow-cloud-references-"
+                    )
+                    cloud_paths = await download_cloud_reference_images(
+                        req.cloud_reference_images,
+                        storage_uri=settings.storage_uri,
+                        temp_dir=Path(cloud_reference_temp.name),
+                    )
+                    req = dataclasses.replace(
+                        req,
+                        ref_paths=(*req.ref_paths, *cloud_paths),
+                        cloud_reference_images=(),
+                    )
                 count = task.payload.get("count", 1)
                 project_id = task.payload.get("project_id")
 
@@ -521,6 +539,9 @@ class FlowWorker:
                 # failed before any media id existed still writes NULL, as before.
                 flow_media_id=started_media_ids[0] if started_media_ids else None,
             )
+        finally:
+            if cloud_reference_temp is not None:
+                cloud_reference_temp.cleanup()
 
     def _build_image_request(self, payload: dict[str, Any]) -> GenerateImageRequest:
         # Delegates to the codec (Task C2) — the single mapping from a queue

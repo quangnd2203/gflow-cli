@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP image generation accepts S3 reference images.** `gflow_generate_image` now accepts
+  `cloud_reference_images` from the bucket configured in `GFLOW_CLI_STORAGE_URI`. The
+  queued worker validates and downloads each image immediately before generation, enforces
+  the 20 MiB limit, and passes it through the existing local-reference upload path.
+
 ### Fixed
 
 - **MCP generation results include cloud storage URIs.** Completed image and video

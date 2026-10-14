@@ -81,7 +81,8 @@ default image/video key layout. See [EXTERNAL_STORAGE.md](EXTERNAL_STORAGE.md).
 
 ### `GFLOW_CLI_STORAGE_URI`
 
-**What:** Optional cloud storage URI prefix for generated assets.
+**What:** Optional cloud storage URI prefix for generated assets; for MCP image
+generation, an S3 bucket here also allowlists `cloud_reference_images` inputs.
 **Values:** `gs://bucket/prefix/` for Google Cloud Storage or
 `s3://bucket/prefix/` for S3-compatible storage, including MinIO.
 **Default:** unset, which means local filesystem output.
@@ -96,6 +97,12 @@ When set, `gflow-cli` uploads generated assets to the cloud prefix instead of
 saving local asset copies. It does not dual-write local + cloud copies. The
 local SQLite catalog still records the operation and stores `storage_provider`
 plus `cloud_uri` for each uploaded asset.
+
+For MCP `gflow_generate_image`, an S3 URI in `cloud_reference_images` must use
+the same bucket configured here (the input key may use a different prefix).
+The worker reads the object using the normal AWS credential chain. Without an
+S3 `GFLOW_CLI_STORAGE_URI`, S3 image references are rejected; see
+[EXTERNAL_STORAGE.md](EXTERNAL_STORAGE.md#s3-image-references-from-mcp).
 
 Examples:
 

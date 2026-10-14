@@ -152,6 +152,10 @@ Security responsibilities for cloud storage:
   layer. `gflow-cli` does not manage provider-side IAM policy.
 - Treat object names and `cloud_uri` values as metadata. The local SQLite
   catalog stores those URIs so `gflow data media <media-id>` can find outputs.
+- MCP image references may also place an S3 URI in the local generation queue
+  until a worker executes it. Reads are limited to the bucket in
+  `GFLOW_CLI_STORAGE_URI`; protect the database and grant the process only the
+  bucket permissions it needs.
 
 `gflow-cli` still redacts Flow signed CDN URLs before writing metadata. Bucket
 URIs are not signed Flow URLs; they are the durable output locations you asked
