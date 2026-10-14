@@ -86,7 +86,17 @@ def validate_cloud_reference_uri(uri: str, *, storage_uri: str | None = None) ->
 def validate_cloud_reference_uris(
     uris: object, *, storage_uri: str | None = None
 ) -> tuple[str, ...]:
-    """Validate a wire-format cloud-reference list and return an immutable copy."""
+    """Validate references for use, requiring the configured S3 storage bucket."""
+    if storage_uri is None:
+        raise CloudReferenceError(
+            "S3 image references require GFLOW_CLI_STORAGE_URI to configure an S3 bucket."
+        )
+    validated = validate_cloud_reference_syntax_uris(uris)
+    return tuple(validate_cloud_reference_uri(uri, storage_uri=storage_uri) for uri in validated)
+
+
+def validate_cloud_reference_syntax_uris(uris: object) -> tuple[str, ...]:
+    """Validate only the queue wire syntax, without requiring runtime storage config."""
     if not isinstance(uris, (list, tuple)):
         raise CloudReferenceError("cloud_reference_images must be a list of S3 URI strings.")
     uri_values_raw = cast(list[object] | tuple[object, ...], uris)
@@ -95,7 +105,7 @@ def validate_cloud_reference_uris(
         if not isinstance(uri, str):
             raise CloudReferenceError("cloud_reference_images must be a list of S3 URI strings.")
         uri_values.append(uri)
-    return tuple(validate_cloud_reference_uri(uri, storage_uri=storage_uri) for uri in uri_values)
+    return tuple(validate_cloud_reference_uri(uri) for uri in uri_values)
 
 
 def _read_bounded(uri: str) -> bytes:

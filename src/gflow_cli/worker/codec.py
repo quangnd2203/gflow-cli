@@ -35,7 +35,7 @@ from gflow_cli.api.video import Aspect as VideoAspect
 from gflow_cli.api.video import GenerateVideoRequest, VideoModel
 from gflow_cli.api.video import Mode as VideoMode
 from gflow_cli.api.video import Tier as VideoTier
-from gflow_cli.cloud_references import validate_cloud_reference_uris
+from gflow_cli.cloud_references import validate_cloud_reference_syntax_uris
 from gflow_cli.config import UiMode
 from gflow_cli.data.redaction import redact_error_detail
 from gflow_cli.errors import CloudReferenceError, QueueSchemaError
@@ -200,7 +200,7 @@ def build_image_request(payload: dict[str, Any]) -> GenerateImageRequest:
     )
     ref_paths = tuple(Path(p) for p in payload.get("ref_paths", []))
     try:
-        cloud_reference_images = validate_cloud_reference_uris(
+        cloud_reference_images = validate_cloud_reference_syntax_uris(
             payload.get("cloud_reference_images", [])
         )
     except CloudReferenceError as exc:

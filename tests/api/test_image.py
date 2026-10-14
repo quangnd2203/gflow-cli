@@ -222,6 +222,18 @@ class TestReferenceCap:
                 ref_paths=(Path("c.png"), Path("d.png")),
             )
 
+    def test_cap_counts_cloud_references_with_local_references(self) -> None:
+        with pytest.raises(ValueError, match="at most 3"):
+            GenerateImageRequest(
+                prompt="mix",
+                model=Model.IMAGEN_3_5,
+                ref_paths=(Path("local-a.png"), Path("local-b.png")),
+                cloud_reference_images=(
+                    "s3://bucket/a.png",
+                    "s3://bucket/b.png",
+                ),
+            )
+
     def test_nano_allows_ten(self) -> None:
         req = GenerateImageRequest(
             prompt="ten refs",

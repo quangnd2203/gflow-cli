@@ -37,6 +37,14 @@ def test_v1_round_trip_preserves_top_level_fields() -> None:
     assert encode_payload("t2i", decode_payload("t2i", payload)) == payload
 
 
+def test_cloud_reference_payload_is_syntax_validated_without_storage_configuration() -> None:
+    decoded = decode_payload(
+        "i2i", {"prompt": "sunrise", "cloud_reference_images": ["s3://bucket/input/ref.png"]}
+    )
+    assert isinstance(decoded.request, GenerateImageRequest)
+    assert decoded.request.cloud_reference_images == ("s3://bucket/input/ref.png",)
+
+
 def test_v0_payload_upgrades_to_v1_on_encode() -> None:
     """A legacy payload with no version key encodes at the CURRENT version —
     this is the behaviour new enqueue sites rely on to stamp schema_version."""

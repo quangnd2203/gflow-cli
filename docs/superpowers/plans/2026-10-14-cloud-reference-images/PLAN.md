@@ -56,7 +56,8 @@ docs/EXTERNAL_STORAGE.md
 - [x] Decode only a list of strings and include cloud refs in the model-cap invariant.
 - [x] Keep local paths from `reference_images` before cloud paths; Flow UUIDs retain picker handling.
 
-**Tests:** Test implementation is intentionally delegated to the user for this pass.
+**Tests:** Covered by the follow-up regression tests in `tests/mcp/test_cloud_reference_images.py`
+and `tests/worker/test_codec.py`.
 
 ## Task 2 — Bounded S3 reader and worker integration
 
@@ -71,7 +72,8 @@ docs/EXTERNAL_STORAGE.md
 - [x] Sanitize S3 exceptions and perform no Flow work after a download failure.
 - [x] Clear cloud URIs from the request after replacing them with local paths; clean the directory on all task exits.
 
-**Tests:** Test implementation is intentionally delegated to the user for this pass.
+**Tests:** Covered by `tests/test_cloud_references.py` and
+`tests/worker/test_cloud_references.py`, including failure-before-Flow and cleanup paths.
 
 ## Task 3 — Documentation
 
@@ -89,5 +91,8 @@ docs/EXTERNAL_STORAGE.md
 ## Definition of done
 
 - [x] Tasks 1–3 implementation and documentation complete.
-- [ ] Tests and project checks are intentionally left for the user, as requested.
-- [ ] MCP schema and documentation describe the final contract accurately.
+- [x] MCP, codec, worker, reader, and model-cap regression tests added and passing.
+- [x] Full repository quality gates and live MCP schema verification complete.
+- [x] Live `tools/list` exposes `cloud_reference_images`; existing `reference_images`
+  and generated `cloud_uris` behavior remain covered and unchanged.
+- [x] Read-only SeaweedFS object access confirmed; no generation was submitted.
