@@ -73,36 +73,33 @@ def configure_logging(log_format: LogFormat = LogFormat.AUTO) -> None:
     Logs are written to **stderr** (stdout is reserved for command output such
     as ``--json`` payloads, so a consumer can ``json.loads(stdout)`` cleanly).
     Renders text on a TTY, JSON when stderr is piped (``LogFormat.AUTO``).
-    Sets ``show_locals=False`` on the exception renderer so frame locals
-    (which can contain auth tokens or signed URLs) are NEVER serialized.
-
-    The implementation uses the explicit
-    :class:`structlog.processors.ExceptionRenderer` +
-    :class:`structlog.tracebacks.ExceptionDictTransformer` pair rather than
-    the simpler ``format_exc_info`` processor. ``format_exc_info`` does NOT
-    accept a ``show_locals`` flag; its default behaviour happens to omit
-    locals today, but a future maintainer who swaps in
-    ``RichTracebackFormatter(show_locals=True)`` could silently leak frame
-    locals (auth tokens). The explicit form makes the privacy contract
-    visible at the call site.
+    JSON exceptions are converted into structured traceback dictionaries with
+    ``show_locals=False``. TEXT exceptions go directly to ConsoleRenderer's
+    explicit plain traceback formatter, which also omits frame locals. These
+    paths must stay separate: ConsoleRenderer expects a string, not the list
+    produced by ExceptionDictTransformer, and its default Rich formatter may
+    include sensitive frame locals.
     """
     log_format = LogFormat.JSON if resolves_to_json(log_format) else LogFormat.TEXT
 
     timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
-    exc_renderer = structlog.processors.ExceptionRenderer(
-        structlog.tracebacks.ExceptionDictTransformer(show_locals=False),
-    )
     shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         timestamper,
         structlog.processors.StackInfoRenderer(),
-        exc_renderer,
     ]
     renderer: Any
     if log_format == LogFormat.TEXT:
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
+        renderer = structlog.dev.ConsoleRenderer(
+            colors=True, exception_formatter=structlog.dev.plain_traceback
+        )
     else:
+        shared_processors.append(
+            structlog.processors.ExceptionRenderer(
+                structlog.tracebacks.ExceptionDictTransformer(show_locals=False),
+            )
+        )
         renderer = structlog.processors.JSONRenderer()
     structlog.configure(
         processors=[*shared_processors, renderer],

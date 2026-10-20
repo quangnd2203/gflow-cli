@@ -11,14 +11,20 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import structlog
 
 from gflow_cli.api.video import VideoResult, VideoStatus
+from gflow_cli.config import LogFormat
 from gflow_cli.data.store import DataStore
+from gflow_cli.errors import TransportTimeoutError
+from gflow_cli.observability import configure_logging
+from gflow_cli.worker.queue import QueueRepository
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -97,6 +103,54 @@ class _FakeFlowApiClient:
 
 
 class TestGenerateImageWired:
+    @pytest.mark.asyncio
+    async def test_text_logger_does_not_mask_timeout_or_leave_task_processing(
+        self, temp_db: DataStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A timeout in create_project must survive two worker error logs and reach MCP."""
+        from gflow_cli.mcp.tools import _TokenBucket, gflow_generate_image
+
+        output = StringIO()
+        monkeypatch.setattr("sys.stderr", output)
+        client = _FakeFlowApiClient()
+        client.create_project.side_effect = TransportTimeoutError(detail="jHPbke timed out")
+        configure_logging(LogFormat.TEXT)
+        try:
+            with (
+                patch("gflow_cli.mcp.tools._rate_limiter", _TokenBucket()),
+                patch("gflow_cli.mcp.tools._resolve_and_validate_profile", return_value="default"),
+                patch("gflow_cli.worker.daemon.FlowApiClient", return_value=client),
+                patch(
+                    "gflow_cli.mcp.tools.get_settings",
+                    return_value=MagicMock(
+                        resolved_db_path=lambda: temp_db.path,
+                        profile_subdir=lambda _: tmp_path / "profile_default",
+                    ),
+                ),
+                patch(
+                    "gflow_cli.worker.daemon.get_settings",
+                    return_value=MagicMock(
+                        profile_subdir=lambda _: tmp_path / "profile_default",
+                        headless=True,
+                        transport=None,
+                        output_dir=tmp_path / "out",
+                        history_prompts=False,
+                    ),
+                ),
+            ):
+                result = await gflow_generate_image(prompt="offline timeout regression")
+
+            task = QueueRepository(temp_db).get_task(result["task_id"])
+            assert result["status"] == "failed"
+            assert task is not None and task.status == "failed"
+            assert task.error is not None
+            assert "jHPbke timed out" in str(task.error["detail"])
+            assert "Failed during image generation or recording" in output.getvalue()
+            assert "Task execution failed" in output.getvalue()
+            assert "TypeError" not in output.getvalue()
+        finally:
+            structlog.reset_defaults()
+
     @pytest.mark.asyncio
     async def test_image_t2i_returns_completed(self, temp_db: DataStore, tmp_path: Path) -> None:
         """gflow_generate_image should return status='completed' with the wired path."""

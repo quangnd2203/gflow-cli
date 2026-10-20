@@ -14,7 +14,12 @@ import structlog
 from packaging.requirements import Requirement
 
 from gflow_cli.config import LogFormat
-from gflow_cli.errors import AuthExpiredError, ContentPolicyError, WireFormatError
+from gflow_cli.errors import (
+    AuthExpiredError,
+    ContentPolicyError,
+    TransportTimeoutError,
+    WireFormatError,
+)
 from gflow_cli.observability import (
     configure_logging,
     emit_error_event,
@@ -77,6 +82,42 @@ def test_show_locals_is_false_in_exception_renderer():
             log.exception("oops")
         output = fake_pipe.getvalue()
     assert "DO_NOT_LEAK_xyz123" not in output
+
+
+@pytest.mark.parametrize("format", [LogFormat.TEXT, LogFormat.JSON])
+def test_error_logging_never_masks_transport_exception_or_exposes_locals(
+    monkeypatch: pytest.MonkeyPatch, format: LogFormat
+) -> None:
+    """The image worker and MCP catch/raise paths must not crash inside structlog.
+
+    In TEXT mode an ExceptionDictTransformer list used to reach ConsoleRenderer,
+    which concatenated it to a string and masked the original Flow timeout.
+    """
+    sink = StringIO()
+    sink.isatty = lambda: format == LogFormat.TEXT  # type: ignore[method-assign]
+    monkeypatch.setattr("sys.stderr", sink)
+    configure_logging(format)
+    log = structlog.get_logger("test")
+
+    upstream_error = TransportTimeoutError(detail="upstream RPC timed out")
+    with pytest.raises(TransportTimeoutError) as caught:
+        try:
+            secret_frame_local = "DO_NOT_LEAK_PRIVATE_FRAME_VALUE"  # noqa: F841
+            raise upstream_error
+        except TransportTimeoutError as exc:
+            log.warning("Failed during image generation or recording", exc_info=exc)
+            log.exception("Task execution failed", exc_info=exc)
+            raise
+
+    assert caught.value is upstream_error
+    output = sink.getvalue()
+    assert "Failed during image generation or recording" in output
+    assert "Task execution failed" in output
+    assert "TransportTimeoutError" in output
+    assert "DO_NOT_LEAK_PRIVATE_FRAME_VALUE" not in output
+    if format == LogFormat.JSON:
+        events = [json.loads(line) for line in output.splitlines()]
+        assert all(isinstance(event["exception"], list) for event in events)
 
 
 def test_logs_go_to_stderr_not_stdout(monkeypatch):
