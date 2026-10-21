@@ -835,9 +835,12 @@ async def run_pipelined_image_batch(
     recorder: OperationRecorder | None,
     command: str,
     reference_paths: tuple[Path, ...] = (),
+    required_mode: UiMode | None = None,
+    on_project_resolved: Callable[[str], None] | None = None,
+    on_before_submissions: Callable[[], None] | None = None,
 ) -> list[BatchOutcome]:
     """CLI opt-in fast path: submit all independent prompts, then download in order."""
-    if resolve_ui_mode(None) is UiMode.AGENTIC:
+    if (required_mode or resolve_ui_mode(None)) is UiMode.AGENTIC:
         raise ConfigurationError("--pipeline uses Flow Classic, not Agent mode")
     if len(set(reference_paths)) != len(reference_paths):
         raise ConfigurationError("--pipeline --ref paths must be distinct")
@@ -853,6 +856,8 @@ async def run_pipelined_image_batch(
         if not isinstance(client.transport, UiAutomationTransport):
             raise ConfigurationError("--pipeline requires the ui_automation transport")
         pid = project_id or (await client.create_project(title=project_title)).project_id
+        if on_project_resolved is not None:
+            on_project_resolved(pid)
         shared_refs = tuple(
             [await client.upload_reference(pid, ref_path) for ref_path in reference_paths]
         )
@@ -868,6 +873,9 @@ async def run_pipelined_image_batch(
             )
             for item in prompts
         ]
+        # Persist an indeterminate-on-crash marker BEFORE the first credit gesture.
+        if on_before_submissions is not None:
+            on_before_submissions()
         results = await client.transport.generate_images_pipelined(
             project_id=pid,
             prompts=requests,

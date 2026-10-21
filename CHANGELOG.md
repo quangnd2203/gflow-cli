@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP image multi-prompt input.** `gflow_generate_image(prompts="...")` retains
+  the single-prompt path, while `prompts=["p1", "p2", ...]` uses Classic T2I
+  Pipeline. Legacy `prompt` remains supported. One worker queue task stores
+  a pre-submit checkpoint and returns `prompt_results` with media IDs, local
+  files and cloud URIs for every image; all top-level files are aggregated.
 - **Opt-in image prompt pipeline for the CLI.** `gflow image t2i --pipeline "p1" "p2"`
   drives the `flow.google.com` Classic composer with overlapping image requests,
   correlates each response with its originating `ogiZ0b` request, and downloads

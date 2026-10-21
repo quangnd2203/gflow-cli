@@ -448,6 +448,65 @@ async def _run_generation_task(
                             lf.cloud_uri for lf in asset.local_files if lf.cloud_uri is not None
                         ]
 
+            prompt_results: list[dict[str, Any]] | None = None
+            if task_type == "t2i_batch":
+                persisted = completed_task.checkpoint or {}
+                all_ids = cast("list[str]", persisted.get("media_ids") or [])
+                input_prompts = cast("list[str]", completed_task.payload["prompts"])
+                variation_count = int(completed_task.payload.get("count", 1))
+                if len(all_ids) != len(input_prompts) * variation_count:
+                    return {
+                        "status": "failed",
+                        "task_id": task_id,
+                        "error": {
+                            "detail": "Batch completed with incomplete media IDs in checkpoint."
+                        },
+                    }
+                data_repo = DataRepository(store)
+                prompt_results = []
+                file_paths = []
+                cloud_uris = []
+                for index, text in enumerate(input_prompts):
+                    row_images: list[dict[str, Any]] = []
+                    for media_id in all_ids[
+                        index * variation_count : (index + 1) * variation_count
+                    ]:
+                        media = data_repo.get_asset_by_flow_media_id(profile, media_id)
+                        if media is None:
+                            return {
+                                "status": "failed",
+                                "task_id": task_id,
+                                "error": {
+                                    "detail": f"Generated media {media_id} has no catalog record."
+                                },
+                            }
+                        files = [
+                            str(local.path) for local in media.local_files if local.path is not None
+                        ]
+                        uris = [
+                            local.cloud_uri
+                            for local in media.local_files
+                            if local.cloud_uri is not None
+                        ]
+                        file_paths.extend(files)
+                        cloud_uris.extend(uris)
+                        row_images.append(
+                            {
+                                "flow_media_id": media_id,
+                                "flow_workflow_id": media.flow_workflow_id,
+                                "files": files,
+                                "cloud_uris": uris,
+                            }
+                        )
+                        flow_project_id = media.flow_project_id
+                    prompt_results.append(
+                        {
+                            "prompt_index": index,
+                            "prompt": text,
+                            "images": row_images,
+                        }
+                    )
+
         log.info(
             "mcp.tool.task_completed",
             task_id=task_id,
@@ -464,6 +523,7 @@ async def _run_generation_task(
             "flow_workflow_id": flow_workflow_id,
             "files": file_paths,
             "cloud_uris": cloud_uris,
+            **({"prompt_results": prompt_results} if prompt_results is not None else {}),
         }
 
     except GFlowError as exc:
@@ -764,7 +824,8 @@ def _build_video_media_inputs(
     name="gflow_generate_image",
     description=(
         "Generate an image using Google Flow's Imagen model. "
-        "Produces 1-4 images from a text prompt. "
+        "Accepts prompts as a string (one prompt) or an array (Classic T2I Pipeline), "
+        "with each output mapped to its prompt. The legacy prompt argument remains supported. "
         "Models: nano2 (fast), nano2-lite (lightweight), nano-pro (balanced), "
         "image4 (highest quality). "
         "Aspects: 1:1, 9:16, 16:9, 4:3, 3:4. "
@@ -782,7 +843,7 @@ def _build_video_media_inputs(
 )
 @_guarded
 async def gflow_generate_image(
-    prompt: str,
+    prompt: str | None = None,
     model: str = "nano2",
     aspect: str = "1:1",
     count: int = 1,
@@ -799,11 +860,15 @@ async def gflow_generate_image(
     ui_mode: str | None = None,
     output: str | None = None,
     wait: bool = True,
+    prompts: str | list[str] | None = None,
 ) -> dict[str, Any]:
     """Generate an image via Google Flow's Imagen.
 
     Args:
-        prompt: The text prompt describing the desired image. Supports ``@AssetName``
+        prompts: A string for the existing single-prompt path, or an array of distinct
+            strings for the overlapping Classic T2I Pipeline.
+        prompt: Legacy single-prompt argument. Do not provide together with prompts.
+            Supports ``@AssetName``
             mentions to tag a saved project character or media asset by name (resolves to
             referenceEntities / referenceImages, deduped against reference_images). Use
             ``@Name`` for a saved named asset; use ``reference_images`` for an arbitrary
@@ -880,9 +945,49 @@ async def gflow_generate_image(
         return resolved  # profile error — bail out early
     resolved_profile = resolved
 
+    if prompt is not None and prompts is not None:
+        return _bad_param("Ambiguous prompts", "Pass either prompt or prompts, not both.")
+    value = cast("str | list[Any] | None", prompts if prompts is not None else prompt)
+    if isinstance(value, str):
+        if not value.strip():
+            return _bad_param("Invalid prompts", "A prompt must not be empty.")
+        prompt_text = value
+        prompt_list: list[str] | None = None
+    elif isinstance(value, list):
+        if (
+            not value
+            or len(value) > 50
+            or any(not isinstance(item, str) or not item.strip() for item in value)
+        ):
+            return _bad_param("Invalid prompts", "Provide 1-50 nonempty prompt strings.")
+        if len(set(value)) != len(value) or any(
+            a in b for i, a in enumerate(value) for j, b in enumerate(value) if i != j
+        ):
+            return _bad_param("Invalid prompts", "Pipeline prompts must be distinct.")
+        prompt_text = value[0]
+        prompt_list = value
+    else:
+        return _bad_param("Missing prompts", "Pass prompts as string or array of strings.")
+    if prompt_list is not None:
+        if (
+            seed is not None
+            or output is not None
+            or instructions
+            or tools
+            or reference_entities
+            or reference_entity_names
+        ):
+            return _bad_param(
+                "Unsupported batch option",
+                "Array prompts do not support seed, output, instructions, "
+                "tools or character entities.",
+            )
+        if ui_mode is not None and ui_mode.lower() == UiMode.AGENTIC.value:
+            return _bad_param("Unsupported batch mode", "Array prompts require Flow Classic.")
+
     log.info(
         "mcp.tool.generate_image",
-        prompt=prompt[:80],
+        prompt_count=len(prompt_list) if prompt_list is not None else 1,
         model=model,
         aspect=aspect,
         count=count,
@@ -896,11 +1001,13 @@ async def gflow_generate_image(
     tool_specs = adapted
 
     payload: dict[str, Any] = {
-        "prompt": prompt,
+        "prompt": prompt_text,
         "model": model,
         "aspect": aspect,
         "count": count,
     }
+    if prompt_list is not None:
+        payload["prompts"] = prompt_list
     if instructions:
         payload["instructions"] = list(instructions)
     if ui_mode is not None:
@@ -920,7 +1027,7 @@ async def gflow_generate_image(
     if reference_entity_names:
         payload["reference_entity_names"] = list(reference_entity_names)
 
-    task_type = "t2i"
+    task_type = "t2i_batch" if prompt_list is not None else "t2i"
     if cloud_reference_images:
         try:
             cloud_refs = validate_cloud_reference_uris(
@@ -929,7 +1036,8 @@ async def gflow_generate_image(
         except GFlowError as exc:
             return _bad_param("Invalid Cloud Reference", exc.detail)
         payload["cloud_reference_images"] = list(cloud_refs)
-        task_type = "i2i"
+        if prompt_list is None:
+            task_type = "i2i"
 
     if reference_images:
         ref_data, err = _resolve_image_references(reference_images)
@@ -938,7 +1046,8 @@ async def gflow_generate_image(
         assert ref_data is not None
         payload["refs"] = ref_data["refs"]
         payload["ref_paths"] = ref_data["ref_paths"]
-        task_type = "i2i"
+        if prompt_list is None:
+            task_type = "i2i"
 
     if tool_specs:
         payload["tool_specs"] = list(tool_specs)
@@ -952,7 +1061,8 @@ async def gflow_generate_image(
 
     # Annotate the result with the original request parameters for context.
     result["params"] = {
-        "prompt": prompt,
+        "prompt": prompt_text if prompt_list is None else None,
+        "prompts": prompt_list if prompt_list is not None else prompt_text,
         "model": model,
         "aspect": aspect,
         "count": count,

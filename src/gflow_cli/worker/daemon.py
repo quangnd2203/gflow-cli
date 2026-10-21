@@ -171,7 +171,107 @@ class FlowWorker:
         cloud_reference_temp: tempfile.TemporaryDirectory[str] | None = None
 
         try:
-            if task.task_type in ("t2i", "i2i"):
+            if task.task_type == "t2i_batch":
+                from gflow_cli.config import UiMode
+                from gflow_cli.errors import ConfigurationError
+                from gflow_cli.image_batch import BatchPromptItem, run_pipelined_image_batch
+                from gflow_cli.paths import resolve_batch_output_dir
+
+                req = (
+                    cast("GenerateImageRequest", task.decoded.request)
+                    if task.decoded is not None
+                    else self._build_image_request(task.payload)
+                )
+                # The CLI pipeline attaches local references through a single upload
+                # per file. A catalog UUID must have a verified local fallback.
+                paths = list(req.ref_paths)
+                for ref in req.refs:
+                    if not ref.local_path or not Path(ref.local_path).is_file():
+                        raise ConfigurationError(
+                            "MCP Pipeline UUID references require a verified local catalog file"
+                        )
+                    paths.append(Path(ref.local_path))
+                if req.cloud_reference_images:
+                    cloud_reference_temp = tempfile.TemporaryDirectory(
+                        prefix="gflow-cloud-references-"
+                    )
+                    cloud_paths = await download_cloud_reference_images(
+                        req.cloud_reference_images,
+                        storage_uri=settings.storage_uri,
+                        temp_dir=Path(cloud_reference_temp.name),
+                    )
+                    paths.extend(cloud_paths)
+                prompts = tuple(
+                    BatchPromptItem(
+                        text=text,
+                        index=index,
+                        aspect_ratio=task.payload.get("aspect", "1:1"),
+                        model=task.payload.get("model", "nano2"),
+                        count=req.count,
+                    )
+                    for index, text in enumerate(task.payload["prompts"])
+                )
+                recorder = OperationRecorder(
+                    DataRepository(self.db), prompt_mode=settings.history_prompts
+                )
+                requested_mode = task.payload.get("ui_mode", "classic")
+                if requested_mode not in ("auto", "classic"):
+                    raise ConfigurationError("Array prompts use Classic T2I Pipeline only")
+
+                outcomes = await run_pipelined_image_batch(
+                    profile_dir=profile_dir,
+                    headless=headless,
+                    transport=transport,
+                    prompts=prompts,
+                    output_dir=resolve_batch_output_dir(
+                        cli_override=None, output_root=settings.output_dir, kind="images"
+                    ),
+                    project_title=task.payload.get("project_name", "gflow-cli images"),
+                    project_id=task.payload.get("project_id"),
+                    client_factory=None,
+                    jitter_range=(0.0, 0.0),
+                    profile_name=self.profile_name,
+                    recorder=recorder,
+                    command="mcp image batch",
+                    reference_paths=tuple(paths),
+                    required_mode=UiMode.CLASSIC,
+                    on_project_resolved=lambda pid: checkpoint_project_id.__setitem__(0, pid),
+                    on_before_submissions=lambda: save_checkpoint(
+                        "submit_attempted", may_have_spent=True
+                    ),
+                )
+                successful = [image for outcome in outcomes for image in outcome.images]
+                media_ids = tuple(img.media_name for img in successful)
+                workflow_ids = tuple(img.workflow_id for img in successful if img.workflow_id)
+                save_checkpoint(
+                    "batch_results",
+                    may_have_spent=bool(media_ids),
+                    media_ids=media_ids,
+                    workflow_ids=workflow_ids,
+                )
+                started_media_ids.extend(media_ids)
+                failed = [outcome for outcome in outcomes if outcome.status != "ok"]
+                if failed:
+                    raise GFlowError(
+                        detail=(
+                            f"Image batch partially failed: {len(failed)}/{len(prompts)} prompts. "
+                            "Completed media IDs are preserved in the task checkpoint."
+                        ),
+                        route="t2i_batch",
+                    )
+                self.repo.update_task_status(
+                    task.task_id,
+                    status="completed",
+                    flow_media_id=media_ids[0] if media_ids else None,
+                )
+                logger.info(
+                    "Image batch completed",
+                    task_id=task.task_id,
+                    prompts=len(prompts),
+                    images=len(media_ids),
+                )
+
+            elif task.task_type in ("t2i", "i2i"):
                 req = (
                     cast("GenerateImageRequest", task.decoded.request)
                     if task.decoded is not None

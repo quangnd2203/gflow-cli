@@ -39,13 +39,15 @@ class TestMcpToolListing:
         )
 
     def test_generate_image_tool_has_required_params(self, mcp_server: Any) -> None:
-        """gflow_generate_image should accept prompt + model/aspect/count/seed/tools/profile."""
+        """Legacy prompt and new prompts are mutually exclusive runtime alternatives."""
         tool = mcp_server._tool_manager._tools["gflow_generate_image"]
         schema = tool.parameters
-        required_fields = {"prompt"}
-        assert required_fields.issubset(set(schema.get("required", []))), (
-            f"Missing required fields: {required_fields}"
-        )
+        assert {"prompt", "prompts"} <= set(schema.get("properties", {}))
+        assert "prompt" not in schema.get("required", [])
+        assert "prompts" not in schema.get("required", [])
+        variants = schema["properties"]["prompts"]["anyOf"]
+        assert {"type": "string"} in variants
+        assert any(v.get("type") == "array" and v["items"]["type"] == "string" for v in variants)
         # CLI/MCP symmetry (AGENTS.md): the CLI --tool option mirrors to a `tools` param.
         assert "tools" in schema.get("properties", {}), (
             "MCP image tool missing 'tools' (CLI parity)"

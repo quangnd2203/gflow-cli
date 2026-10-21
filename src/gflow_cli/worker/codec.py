@@ -49,7 +49,7 @@ __all__ = [
     "encode_payload",
 ]
 
-_IMAGE_TASK_TYPES = frozenset({"t2i", "i2i"})
+_IMAGE_TASK_TYPES = frozenset({"t2i", "i2i", "t2i_batch"})
 _VIDEO_TASK_TYPES = frozenset({"t2v", "i2v", "r2v"})
 _KNOWN_TASK_TYPES = _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES
 
@@ -102,6 +102,34 @@ def decode_payload(task_type: str, payload: dict[str, Any]) -> DecodedPayload:
         )
 
     fields = {k: v for k, v in payload.items() if k != "schema_version"}
+
+    if task_type == "t2i_batch":
+        raw_prompts = fields.get("prompts")
+        prompts = cast("list[Any]", raw_prompts) if isinstance(raw_prompts, list) else None
+        if (
+            prompts is None
+            or not 1 <= len(prompts) <= 50
+            or any(not isinstance(p, str) or not p.strip() for p in prompts)
+            or len(set(prompts)) != len(prompts)
+            or any(a in b for i, a in enumerate(prompts) for j, b in enumerate(prompts) if i != j)
+            or fields.get("prompt") != prompts[0]
+        ):
+            raise QueueSchemaError("invalid distinct batch prompts (1-50)", route=_CODEC_ROUTE)
+        if (
+            any(
+                fields.get(key)
+                for key in (
+                    "seed",
+                    "instructions",
+                    "tool_specs",
+                    "reference_entities",
+                    "reference_entity_names",
+                    "output_file",
+                )
+            )
+            or fields.get("ui_mode") == "agentic"
+        ):
+            raise QueueSchemaError("unsupported T2I batch option", route=_CODEC_ROUTE)
 
     try:
         request: GenerateImageRequest | GenerateVideoRequest = (
