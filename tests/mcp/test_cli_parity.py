@@ -222,6 +222,8 @@ _CLI_ONLY_PARAMS: frozenset[str] = frozenset(
         "prompts_file",  # shell-input plumbing
         "transport",  # operator concern
         "jitter_spec",  # pacing knob for shell loops (#241)
+        "pipelined",  # CLI-only multi-prompt shell batch; MCP image tool accepts one prompt
+        "pipeline_ref",  # CLI-only shared image for the multi-prompt pipeline
     }
 )
 

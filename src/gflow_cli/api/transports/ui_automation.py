@@ -3368,6 +3368,46 @@ class UiAutomationTransport(VideoGenerationMixin):
     # Public batch API — generate_images_batch (stay-mounted, v3-3)
     # ------------------------------------------------------------------
 
+    async def generate_images_pipelined(
+        self,
+        *,
+        project_id: str,
+        prompts: list[GenerateImageRequest],
+        jitter_range: tuple[float, float],
+    ) -> list[BatchSubmissionResult]:
+        """Overlap independent image submits on the migrated host only.
+
+        Unlike the existing labs batch, listeners stay attached across every
+        submit and responses are bound to the originating Request object.
+        The page is parked only after all in-flight results have been collected.
+        """
+        if not self._setup_done or self._page is None:
+            raise RuntimeError("UiAutomationTransport.setup() required for image pipeline")
+        from gflow_cli.api.transports.migrated_image_pipeline import (  # noqa: PLC0415
+            run_images_pipelined,
+        )
+        from gflow_cli.config import get_settings  # noqa: PLC0415
+
+        async with self._generate_lock:
+            await self.park_deferred_page()
+            page: Page = self._page
+            route = migrated_route(page.url, get_settings().flow_host, prefer_migrated=True)
+            if route != "migrated":
+                raise ConfigurationError(
+                    "image --pipeline currently requires flow.google.com Classic "
+                    "(use the sequential mode on labs.google)"
+                )
+            try:
+                results = await run_images_pipelined(
+                    page, prompts, project_id=project_id, jitter_range=jitter_range
+                )
+            except Exception:
+                # Preserve the incident page on failures, as in generate_images.
+                self._deferred_park_pending = True
+                raise
+            await self._park_composer_page(page, event="migrated.pipeline_page_park_failed")
+            return results
+
     async def generate_images_batch(
         self,
         *,

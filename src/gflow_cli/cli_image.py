@@ -853,6 +853,23 @@ _ui_mode_option = click.option(
     show_default=True,
     help="In multi-prompt mode, continue after per-prompt failures or stop at the first failure.",
 )
+@click.option(
+    "--ref",
+    "pipeline_ref",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help="Shared reference image for every --pipeline prompt; repeat --ref for more.",
+)
+@click.option(
+    "--pipeline",
+    "pipelined",
+    is_flag=True,
+    help=(
+        "Multi-prompt Classic on flow.google.com: submit each independent prompt "
+        "without waiting for prior images, then collect/download all replies. "
+        "Opt-in; --fail-fast is not supported because requests may already be in flight."
+    ),
+)
 @_jitter_option
 @click.option(
     "--model",
@@ -928,6 +945,8 @@ def t2i(  # NOSONAR
     prompts_file: Path | None,
     read_stdin: bool,
     continue_on_error: bool,
+    pipelined: bool,
+    pipeline_ref: tuple[Path, ...],
     jitter_spec: str | None,
     ui_mode: str | None,
     model: str,
@@ -948,6 +967,15 @@ def t2i(  # NOSONAR
     """Generate image(s) from one or more text prompts."""
     is_multi_prompt = len(prompts) > 1 or prompts_file is not None or read_stdin
     _validate_t2i_input(prompts, prompts_file, read_stdin)
+
+    if pipelined and not is_multi_prompt:
+        raise click.UsageError("--pipeline requires multiple prompts.")
+    if pipeline_ref and not pipelined:
+        raise click.UsageError("--ref on t2i requires --pipeline; otherwise use image i2i.")
+    if pipelined and not continue_on_error:
+        raise click.UsageError(
+            "--pipeline cannot use --fail-fast: in-flight requests must be collected."
+        )
 
     if is_multi_prompt and output_file is not None:
         msg = (
@@ -1052,6 +1080,8 @@ def t2i(  # NOSONAR
         jitter_spec,
         project_id,
         project_name,
+        pipelined,
+        pipeline_ref,
     )
 
 
@@ -1127,6 +1157,8 @@ def _execute_t2i_batch(
     jitter_spec: str | None = None,
     project_id: str | None = None,
     project_name: str | None = None,
+    pipelined: bool = False,
+    pipeline_ref: tuple[Path, ...] = (),
 ) -> None:
     """Run a multi-prompt t2i batch and print the summary table.
 
@@ -1165,6 +1197,8 @@ def _execute_t2i_batch(
                 _recorder=recorder,
                 _command="image t2i",
                 project_id=project_id,
+                pipelined=pipelined,
+                pipeline_ref=pipeline_ref,
             ),
         )
     finally:

@@ -301,6 +301,11 @@ Options:
   --continue-on-error /
   --fail-fast               Continue after per-prompt failures or stop at the
                             first failed prompt. [default: continue-on-error]
+  --pipeline                Opt-in overlapping submissions for independent
+                            prompts on flow.google.com Classic. Incompatible
+                            with --fail-fast; use --continue-on-error.
+  --ref FILE                With --pipeline only: add a shared reference image.
+                            Repeat --ref for multiple images; each uploaded once.
   --jitter SPEC             Anti-bot pause between multi-prompt submissions:
                             'MIN-MAX' seconds, a single number for 0-N, or 0
                             to disable. Widen (e.g. 10-30) if runs hit WAF
@@ -356,6 +361,23 @@ Options:
   fan-out is 50 prompts * 4 = 200 images.
 - `--continue-on-error` is default; `--fail-fast` stops after the first failed
   prompt.
+- **Fast pipeline (CLI only):** `gflow image t2i "p1" "p2" "p3" --pipeline
+  --project <id>`. On `flow.google.com` Classic, submits independent prompts
+  back-to-back (subject to `--jitter`) and uses one long-lived `ogiZ0b`
+  request/response collector. Replies can finish out of order; output filenames
+  still follow the input order. Supports `--prompts-file` and `--stdin` too.
+  Duplicate/overlapping prompt texts are refused before submission to prevent
+  ambiguous attribution. Add `--ref image1.jpg --ref image2.jpg` to upload each
+  **shared reference** once, attach all to every prompt by actual Flow media IDs,
+  and guard each submit at the network layer: a request missing **any** requested
+  ID is aborted before generating. The model's reference cap still applies.
+  Each pipeline run writes unique `pipeline_<run-id>_prompt_<index>_<variation>`
+  output filenames in the normal date-partitioned directory to prevent overwrites.
+  Independent per-row refs / `batch:N`
+  dependencies, agentic mode and `--fail-fast` remain unsupported in this opt-in
+  path. No automatic re-submit on timeout (the browser may already have sent
+  the request); omit `--pipeline` to use existing sequential processing. This CLI enhancement has no MCP
+  bulk-prompt twin yet: `gflow_generate_image` still takes one prompt.
 
 **Prompt tools (`-t` / `--tool`).**
 

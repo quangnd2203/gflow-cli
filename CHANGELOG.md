@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opt-in image prompt pipeline for the CLI.** `gflow image t2i --pipeline "p1" "p2"`
+  drives the `flow.google.com` Classic composer with overlapping image requests,
+  correlates each response with its originating `ogiZ0b` request, and downloads
+  results in input order even when completion is out of order. Requires independent
+  prompt texts; the default sequential CLI mode, legacy manifest batches, and
+  single-prompt MCP API remain unchanged. Supports repeatable `--ref FILE` inputs:
+  upload each shared reference once and validate all requested media IDs on every
+  submit before spending image quota. Each CLI pipeline run gets a unique output
+  filename prefix, preventing same-day overwrite. Live verified with 4 prompts:
+  no refs, 1 shared ref, and 2 shared refs (12/12 images recovered and downloaded).
 - **MCP image generation accepts S3 reference images.** `gflow_generate_image` now accepts
   `cloud_reference_images` from the bucket configured in `GFLOW_CLI_STORAGE_URI`. The
   queued worker validates and downloads each image immediately before generation, enforces

@@ -8,7 +8,8 @@ import json
 import random
 import re
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,9 +23,9 @@ from gflow_cli._cli_helpers import (
 )
 from gflow_cli.api.client import FlowApiClient
 from gflow_cli.api.dto import BatchSubmissionResult, ProjectInfo
-from gflow_cli.api.image import Aspect, GenerateImageRequest, ImageRef, Model
+from gflow_cli.api.image import Aspect, GenerateImageRequest, ImageRef, Model, reference_cap_for
 from gflow_cli.api.transports.ui_automation import UiAutomationTransport
-from gflow_cli.config import get_settings, parse_jitter_range
+from gflow_cli.config import UiMode, get_settings, parse_jitter_range, resolve_ui_mode
 from gflow_cli.data.models import OperationKind
 from gflow_cli.data.recorder import (
     OperationRecorder,
@@ -698,8 +699,10 @@ async def run_image_batch(
     # caller's failure rows with another command's name (#341 review).
     _command: str,
     project_id: str | None = None,
+    pipelined: bool = False,
+    pipeline_ref: tuple[Path, ...] = (),
 ) -> list[BatchOutcome]:
-    """Run prompts sequentially through one FlowApiClient session.
+    """Run prompts in a shared FlowApiClient session.
 
     Rows run in dependency order (``order_batch_rows``) but keep their own index for
     file names and results, which are returned in file order. A row whose ``batch:N``
@@ -708,6 +711,27 @@ async def run_image_batch(
     ``project_id`` generates every row into that existing project instead of a new
     one titled ``project_title``; its catalog title is then left as it is.
     """
+    if pipelined:
+        if any(item.ref is not None or item.reference_entity is not None for item in prompts):
+            raise ConfigurationError(
+                "--pipeline supports independent text-only prompts; references need serial mode"
+            )
+        return await run_pipelined_image_batch(
+            profile_dir=profile_dir,
+            headless=headless,
+            transport=transport,
+            prompts=prompts,
+            output_dir=output_dir,
+            project_title=project_title,
+            project_id=project_id,
+            client_factory=client_factory,
+            jitter_range=jitter_range,
+            profile_name=_profile_name,
+            recorder=_recorder,
+            command=_command,
+            reference_paths=pipeline_ref,
+        )
+
     results: dict[int, BatchOutcome] = {}
     # One upload per distinct local file per run (one run, one project).
     uploads: dict[str, ImageRef] = {}
@@ -794,6 +818,87 @@ async def run_image_batch(
         project_id=project_id,
     )
     return sorted(outcomes, key=lambda outcome: outcome.index)
+
+
+async def run_pipelined_image_batch(
+    *,
+    profile_dir: Path,
+    headless: bool,
+    transport: str | None,
+    prompts: tuple[BatchPromptItem, ...],
+    output_dir: Path,
+    project_title: str,
+    project_id: str | None,
+    client_factory: Callable[..., Any] | None,
+    jitter_range: tuple[float, float] | None,
+    profile_name: str | None,
+    recorder: OperationRecorder | None,
+    command: str,
+    reference_paths: tuple[Path, ...] = (),
+) -> list[BatchOutcome]:
+    """CLI opt-in fast path: submit all independent prompts, then download in order."""
+    if resolve_ui_mode(None) is UiMode.AGENTIC:
+        raise ConfigurationError("--pipeline uses Flow Classic, not Agent mode")
+    if len(set(reference_paths)) != len(reference_paths):
+        raise ConfigurationError("--pipeline --ref paths must be distinct")
+    if reference_paths:
+        cap = min(reference_cap_for(Model.from_cli(item.model)) for item in prompts)
+        if len(reference_paths) > cap:
+            raise ConfigurationError("--pipeline references exceed the selected model cap")
+    if jitter_range is None:
+        jitter_range = resolve_jitter_range(None)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    factory = client_factory or FlowApiClient
+    async with factory(profile_dir=profile_dir, headless=headless, transport=transport) as client:
+        if not isinstance(client.transport, UiAutomationTransport):
+            raise ConfigurationError("--pipeline requires the ui_automation transport")
+        pid = project_id or (await client.create_project(title=project_title)).project_id
+        shared_refs = tuple(
+            [await client.upload_reference(pid, ref_path) for ref_path in reference_paths]
+        )
+        requests = [
+            GenerateImageRequest(
+                prompt=item.text,
+                aspect=Aspect.from_cli(item.aspect_ratio),
+                model=Model.from_cli(item.model),
+                count=item.count,
+                refs=shared_refs,
+                original_prompt=item.original_prompt,
+                tool=item.tool,
+            )
+            for item in prompts
+        ]
+        results = await client.transport.generate_images_pipelined(
+            project_id=pid,
+            prompts=requests,
+            jitter_range=jitter_range,
+        )
+        # Each batch shares a date-partitioned output directory. A run-specific
+        # stem keeps later 4-prompt runs from overwriting previous downloads.
+        run_id = uuid.uuid4().hex[:8]
+        output_prompts = tuple(
+            replace(
+                item,
+                output_filename=(
+                    f"pipeline_{run_id}_{item.output_filename or f'prompt_{item.index}'}"
+                ),
+            )
+            for item in prompts
+        )
+        return await _download_results(
+            client=client,
+            prompts=output_prompts,
+            results=results,
+            output_dir=output_dir,
+            profile_name=profile_name,
+            profile_dir=profile_dir,
+            recorder=recorder,
+            continue_on_error=True,
+            command=command,
+            project_title=project_title,
+            project_created=project_id is None,
+            shared_refs=shared_refs,
+        )
 
 
 async def run_sequential_batch(
@@ -1131,6 +1236,9 @@ def _try_record_images(
     item: BatchPromptItem,
     result: BatchSubmissionResult,
     saved: list[Path],
+    project_title: str = "gflow-cli image batch",
+    project_created: bool = True,
+    shared_refs: tuple[ImageRef, ...] = (),
 ) -> None:
     """Persist generated-image metadata; warn on DataStoreError (non-fatal).
 
@@ -1147,11 +1255,24 @@ def _try_record_images(
         recorder=recorder,
         profile_name=profile_name,
         profile_dir=profile_dir,
-        project=ProjectInfo(project_id=result.project_id, title="gflow-cli image batch"),
-        request=_to_request(item),
+        project=ProjectInfo(project_id=result.project_id, title=project_title),
+        request=(
+            GenerateImageRequest(
+                prompt=item.text,
+                model=Model.from_cli(item.model),
+                aspect=Aspect.from_cli(item.aspect_ratio),
+                count=item.count,
+                refs=shared_refs,
+                original_prompt=item.original_prompt,
+                tool=item.tool,
+            )
+            if shared_refs
+            else _to_request(item)
+        ),
         images=list(result.images),
         saved=saved,
-        operation_kind="t2i",
+        operation_kind="i2i" if shared_refs else "t2i",
+        project_created=project_created,
     )
 
 
@@ -1164,6 +1285,9 @@ async def _process_ok_row(
     profile_name: str | None,
     profile_dir: Path | None,
     recorder: OperationRecorder | None,
+    project_title: str = "gflow-cli image batch",
+    project_created: bool = True,
+    shared_refs: tuple[ImageRef, ...] = (),
 ) -> BatchOutcome:
     """Verify attribution, download, and (optionally) record ONE 'ok' row.
 
@@ -1191,9 +1315,18 @@ async def _process_ok_row(
             item=item,
             result=result,
             saved=saved,
+            project_title=project_title,
+            project_created=project_created,
+            shared_refs=shared_refs,
         )
 
-    return BatchOutcome(index=item.index, prompt=item, status="ok", saved_paths=saved)
+    return BatchOutcome(
+        index=item.index,
+        prompt=item,
+        status="ok",
+        saved_paths=saved,
+        images=list(result.images),
+    )
 
 
 async def _download_results(
@@ -1206,6 +1339,10 @@ async def _download_results(
     profile_dir: Path | None = None,
     recorder: OperationRecorder | None = None,
     continue_on_error: bool = True,
+    command: str = "image batch",
+    project_title: str = "gflow-cli image batch",
+    project_created: bool = True,
+    shared_refs: tuple[ImageRef, ...] = (),
 ) -> list[BatchOutcome]:
     """Download images from ok BatchSubmissionResults and build BatchOutcome list.
 
@@ -1231,8 +1368,8 @@ async def _download_results(
                     logger=logger,
                     profile_name=profile_name,
                     profile_dir=profile_dir,
-                    command="image batch",
-                    mode=OperationKind.T2I,
+                    command=command,
+                    mode=OperationKind.I2I if shared_refs else OperationKind.T2I,
                     exc=result.error,
                     request=_to_request(item),
                     flow_project_id=result.project_id,
@@ -1247,6 +1384,7 @@ async def _download_results(
                         if result.error
                         else "unknown"
                     ),
+                    exit_code=(resolve_exit_code(result.error) if result.error else 1),
                 ),
             )
             logger.info(
@@ -1267,6 +1405,9 @@ async def _download_results(
                 profile_name=profile_name,
                 profile_dir=profile_dir,
                 recorder=recorder,
+                project_title=project_title,
+                project_created=project_created,
+                shared_refs=shared_refs,
             )
         except MediaAttributionError as exc:
             if not continue_on_error:
@@ -1288,6 +1429,36 @@ async def _download_results(
                 status="fail",
                 error=f"{type(exc).__name__}: {exc}",
                 exit_code=resolve_exit_code(exc),
+            )
+        except Exception as exc:
+            # Pipeline replies are already complete here; one failed download must
+            # not discard the handles for other successful, in-flight generations.
+            if not continue_on_error:
+                raise
+            logger.warning(
+                "image_batch.download_failed_after_generation",
+                row_idx=item.index,
+                error_class=type(exc).__name__,
+            )
+            if profile_name is not None and profile_dir is not None:
+                record_failed_operation_safe(
+                    recorder,
+                    logger=logger,
+                    profile_name=profile_name,
+                    profile_dir=profile_dir,
+                    command=command,
+                    mode=OperationKind.T2I,
+                    exc=exc,
+                    request=_to_request(item),
+                    flow_project_id=result.project_id,
+                )
+            outcome = BatchOutcome(
+                index=item.index,
+                prompt=item,
+                status="fail",
+                images=list(result.images),
+                error=f"download failed: {type(exc).__name__}: {exc}",
+                exit_code=resolve_exit_code(exc) if isinstance(exc, GFlowError) else 1,
             )
         outcomes.append(outcome)
 
