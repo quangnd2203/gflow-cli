@@ -116,6 +116,7 @@ class FlowWorker:
             operation_id: str | None = None,
             media_ids: tuple[str, ...] = (),
             workflow_ids: tuple[str, ...] = (),
+            batch_rows: list[dict[str, Any]] | None = None,
         ) -> None:
             # Observer-exception policy (C1 deferred decision): a checkpoint-persist
             # failure MUST NOT abort a generation already in flight — that would
@@ -131,6 +132,7 @@ class FlowWorker:
                     operation_id=operation_id,
                     media_ids=media_ids,
                     workflow_ids=workflow_ids,
+                    batch_rows=batch_rows,
                 )
             except Exception as exc:
                 logger.warning(
@@ -243,20 +245,35 @@ class FlowWorker:
                 successful = [image for outcome in outcomes for image in outcome.images]
                 media_ids = tuple(img.media_name for img in successful)
                 workflow_ids = tuple(img.workflow_id for img in successful if img.workflow_id)
+                failed = [outcome for outcome in outcomes if outcome.status != "ok"]
                 save_checkpoint(
                     "batch_results",
                     may_have_spent=bool(media_ids),
                     media_ids=media_ids,
                     workflow_ids=workflow_ids,
+                    batch_rows=[
+                        {
+                            "prompt_index": outcome.index,
+                            "status": "ok" if outcome.status == "ok" else "failed",
+                            "media_ids": [image.media_name for image in outcome.images],
+                        }
+                        for outcome in outcomes
+                    ],
                 )
                 started_media_ids.extend(media_ids)
-                failed = [outcome for outcome in outcomes if outcome.status != "ok"]
                 if failed:
+                    logger.warning(
+                        "image_batch.partial_result",
+                        task_id=task.task_id,
+                        succeeded=len(outcomes) - len(failed),
+                        failed=len(failed),
+                        # The first error is intentionally summarized without
+                        # prompt text, signed URLs or credential-bearing details.
+                        first_failed_index=failed[0].index,
+                    )
+                if not successful:
                     raise GFlowError(
-                        detail=(
-                            f"Image batch partially failed: {len(failed)}/{len(prompts)} prompts. "
-                            "Completed media IDs are preserved in the task checkpoint."
-                        ),
+                        detail=f"Image batch failed: {len(failed)}/{len(prompts)} prompts.",
                         route="t2i_batch",
                     )
                 self.repo.update_task_status(
@@ -269,6 +286,7 @@ class FlowWorker:
                     task_id=task.task_id,
                     prompts=len(prompts),
                     images=len(media_ids),
+                    failed=len(failed),
                 )
 
             elif task.task_type in ("t2i", "i2i"):

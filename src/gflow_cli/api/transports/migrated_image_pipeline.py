@@ -40,6 +40,13 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+# Browser steps can slow down as Flow's generation queue fills. These are
+# per-prompt deadlines, not the overall batch/session timeout.
+PIPELINE_EDITOR_WAIT_MS = 30_000
+PIPELINE_SUBMIT_VISIBLE_WAIT_MS = 30_000
+PIPELINE_SUBMIT_CLICK_WAIT_MS = 20_000
+PIPELINE_REQUEST_SEEN_TIMEOUT_S = 60.0
+
 
 def _hash(prompt: str) -> str:
     """Log the identity of a prompt without logging its text."""
@@ -189,7 +196,9 @@ class ImageBatchCollector:
         finally:
             self.done[index].set()
 
-    async def await_submission(self, index: int, *, timeout_s: float = 12.0) -> None:
+    async def await_submission(
+        self, index: int, *, timeout_s: float = PIPELINE_REQUEST_SEEN_TIMEOUT_S
+    ) -> None:
         await asyncio.wait_for(self.seen[index].wait(), timeout=timeout_s)
 
     async def wait_results(
@@ -345,7 +354,7 @@ async def run_images_pipelined(
                 field = page.locator(
                     'flow-base-prompt-box div.ProseMirror[contenteditable="true"]'
                 ).first
-                await field.wait_for(state="visible", timeout=10000)
+                await field.wait_for(state="visible", timeout=PIPELINE_EDITOR_WAIT_MS)
                 if references:
                     # The first chips were already bound by reference_existing.
                     # On following submissions, reattach the SAME image by its
@@ -369,8 +378,8 @@ async def run_images_pipelined(
 
                 await composer.send_prompt(page, req.prompt, append=bool(references))
                 submit = await composer._pre_submit_gate(page)  # pyright: ignore[reportPrivateUsage]
-                await submit.wait_for(state="visible", timeout=9000)
-                await submit.click(timeout=6500)
+                await submit.wait_for(state="visible", timeout=PIPELINE_SUBMIT_VISIBLE_WAIT_MS)
+                await submit.click(timeout=PIPELINE_SUBMIT_CLICK_WAIT_MS)
                 await collector.await_submission(index)
                 if collector.done[index].is_set() and collector.results[index].status == "fail":
                     for rest in range(index + 1, len(requests)):

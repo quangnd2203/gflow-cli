@@ -3415,7 +3415,12 @@ async def _wait_anchor(
 
 
 async def _rpc_reply(
-    page: Page, rpcid: str, action: Callable[[], Awaitable[None]], *, timeout_s: float
+    page: Page,
+    rpcid: str,
+    action: Callable[[], Awaitable[None]],
+    *,
+    timeout_s: float,
+    fail_on_unreadable_target: bool = False,
 ) -> Any:
     """Run ``action`` and return the payload of the first ``rpcid`` frame the page gets."""
     reply: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
@@ -3425,7 +3430,27 @@ async def _rpc_reply(
             return
         try:
             text = await response.text()
-        except Exception:  # noqa: BLE001 - an aborted body is not our frame
+        except Exception as exc:
+            # Chrome can report an HTTP 200 rename and commit it server-side
+            # while Playwright cannot read the body after navigation. Signal
+            # that promptly for rename only; its caller verifies the *saved*
+            # title on a fresh page before claiming success.
+            if (
+                fail_on_unreadable_target
+                and _rpcid(str(response.url)) == rpcid
+                and not reply.done()
+            ):
+                reply.set_exception(
+                    TransportTimeoutError(
+                        detail=f"flow.google.com {rpcid} response body unreadable on "
+                        f"{safe_page_url(page.url)} (host=migrated)"
+                    )
+                )
+                log.warning(
+                    "migrated.project_rename_reply_unreadable",
+                    rpcid=rpcid,
+                    error_class=type(exc).__name__,
+                )
             return
         for rid, payload in parse_frames(text):
             if rid == rpcid and not reply.done():
@@ -3497,11 +3522,51 @@ async def rename_project(
         timeout_s=timeout_s,
     )
 
+    # Enter on an unchanged title need not issue an RPC at all. Previously
+    # this legitimate no-op caused a misleading 30 s o8DA4 timeout.
+    if await field.input_value() == title:
+        log.info("migrated.project_rename_already_named", project_id=project_id)
+        return
+
     async def submit() -> None:
         await field.fill(title)
         await field.press("Enter")
 
-    payload = await _rpc_reply(page, RENAME_PROJECT_RPC, submit, timeout_s=timeout_s)
+    try:
+        payload = await _rpc_reply(
+            page,
+            RENAME_PROJECT_RPC,
+            submit,
+            timeout_s=timeout_s,
+            fail_on_unreadable_target=True,
+        )
+    except TransportTimeoutError:
+        # A missing/unreadable RPC reply does not prove the mutation failed.
+        # Reload from Flow to discard the optimistic input value and inspect
+        # the persisted title. Fail closed on mismatch or verification error.
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=20_000)
+            persisted_input = await _wait_anchor(
+                page,
+                PROJECT_TITLE_INPUT,
+                named="project title input",
+                requested=target,
+                at="migrated.rename_project.verify",
+                timeout_s=10.0,
+            )
+            persisted_title = await persisted_input.input_value()
+        except Exception as exc:
+            log.warning(
+                "migrated.project_rename_verification_failed",
+                project_id=project_id,
+                error_class=type(exc).__name__,
+            )
+            raise
+        if persisted_title != title:
+            log.warning("migrated.project_rename_not_persisted", project_id=project_id)
+            raise
+        log.info("migrated.project_rename_verified_after_rpc_error", project_id=project_id)
+        return
     echo = _as_list_any(payload)
     echoed: object = echo[0] if echo else None
     if echoed != title:

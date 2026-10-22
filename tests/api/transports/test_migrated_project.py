@@ -32,6 +32,8 @@ class _Response:
         self.url, self._text = url, text
 
     async def text(self) -> str:
+        if self._text == "__UNREADABLE__":
+            raise RuntimeError("Protocol error reading response body")
         return self._text
 
 
@@ -53,10 +55,16 @@ class _Loc:
 
     async def fill(self, value: str, **_: Any) -> None:
         self.page.filled = value
+        self.page.current_title = value
 
     async def press(self, key: str, **_: Any) -> None:
         if key == "Enter":
             await self.page.fire(self.page.on_enter)
+
+    async def input_value(self) -> str:
+        return (
+            self.page.server_title if self.page.current_title is None else self.page.current_title
+        )
 
     async def is_visible(self) -> bool:
         return False
@@ -71,6 +79,10 @@ class FakePage:
         self.gotos: list[str] = []
         self.clicks: list[str] = []
         self.filled: str | None = None
+        self.current_title: str | None = None
+        self.server_title = "original title"
+        self.persist_rename_on_enter = False
+        self.reload_count = 0
         self.present: dict[str, bool] = {mc.NEW_PROJECT_BUTTON: True, mc.PROJECT_TITLE_INPUT: True}
         self.on_click: dict[str, tuple[str, str] | None] = {}
         self.on_enter: tuple[str, str] | None = None
@@ -81,6 +93,10 @@ class FakePage:
     async def goto(self, url: str, **_: Any) -> None:
         self.gotos.append(url)
         self.url = url
+
+    async def reload(self, **_: Any) -> None:
+        self.reload_count += 1
+        self.current_title = self.server_title
 
     def locator(self, sel: str) -> _Loc:
         return _Loc(self, sel)
@@ -96,6 +112,8 @@ class FakePage:
     async def fire(self, reply: tuple[str, str] | None) -> None:
         if reply is None:
             return
+        if self.persist_rename_on_enter and reply == self.on_enter:
+            self.server_title = self.filled or ""
         for h in list(self._handlers):
             await h(_Response(*reply))
         if self.navigate_on_create:
@@ -169,6 +187,39 @@ async def test_create_ignores_other_rpcs_while_waiting() -> None:
 
 
 # --- rename -----------------------------------------------------------------------------
+
+
+async def test_unreadable_rename_reply_is_verified_from_reloaded_project() -> None:
+    """The real browser sees HTTP 200 but response.text() raises after UI navigation."""
+    page = FakePage(url=f"https://flow.google.com/project/{PID}")
+    page.server_title = "old title"
+    page.on_enter = (_batch(mc.RENAME_PROJECT_RPC), "__UNREADABLE__")
+    page.persist_rename_on_enter = True
+
+    await mc.rename_project(page, PID, "new title", timeout_s=0.02)  # type: ignore[arg-type]
+
+    assert page.reload_count == 1
+    assert page.server_title == "new title"
+
+
+async def test_unreadable_rename_reply_without_persisted_title_still_fails() -> None:
+    page = FakePage(url=f"https://flow.google.com/project/{PID}")
+    page.server_title = "old title"
+    page.on_enter = (_batch(mc.RENAME_PROJECT_RPC), "__UNREADABLE__")
+
+    with pytest.raises(TransportTimeoutError, match=mc.RENAME_PROJECT_RPC):
+        await mc.rename_project(page, PID, "new title", timeout_s=0.02)  # type: ignore[arg-type]
+
+    assert page.reload_count == 1
+    assert page.server_title == "old title"
+
+
+async def test_rename_skips_rpc_when_project_title_is_already_correct() -> None:
+    page = FakePage(url=f"https://flow.google.com/project/{PID}")
+    page.server_title = "gflow-cli images"
+    await mc.rename_project(page, PID, "gflow-cli images", timeout_s=0.02)  # type: ignore[arg-type]
+    assert page.filled is None
+    assert page.reload_count == 0
 
 
 async def test_rename_navigates_to_the_project_and_confirms_the_echo() -> None:

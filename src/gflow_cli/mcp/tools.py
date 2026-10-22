@@ -454,23 +454,63 @@ async def _run_generation_task(
                 all_ids = cast("list[str]", persisted.get("media_ids") or [])
                 input_prompts = cast("list[str]", completed_task.payload["prompts"])
                 variation_count = int(completed_task.payload.get("count", 1))
-                if len(all_ids) != len(input_prompts) * variation_count:
+                raw_batch_rows: Any = persisted.get("batch_rows")
+                # A partial batch requires explicit index→media mapping.
+                # Without it, flattened media_ids cannot safely be attached
+                # when an earlier prompt failed. Legacy full-success batches
+                # retain their original positional mapping.
+                if raw_batch_rows is None and len(all_ids) == len(input_prompts) * variation_count:
+                    raw_batch_rows = [
+                        {
+                            "prompt_index": i,
+                            "status": "ok",
+                            "media_ids": all_ids[i * variation_count : (i + 1) * variation_count],
+                        }
+                        for i in range(len(input_prompts))
+                    ]
+                rows_to_check = (
+                    cast("list[object]", raw_batch_rows) if isinstance(raw_batch_rows, list) else []
+                )
+
+                def valid_batch_row(index: int, value: object) -> bool:
+                    if not isinstance(value, dict):
+                        return False
+                    row = cast("dict[str, Any]", value)
+                    ids = row.get("media_ids")
+                    media_ids_to_check = cast("list[object]", ids) if isinstance(ids, list) else []
+                    return (
+                        type(row.get("prompt_index")) is int
+                        and row["prompt_index"] == index
+                        and row.get("status") in ("ok", "failed")
+                        and isinstance(ids, list)
+                        and all(isinstance(media_id, str) for media_id in media_ids_to_check)
+                        and len(media_ids_to_check)
+                        == (variation_count if row["status"] == "ok" else 0)
+                    )
+
+                if (
+                    len(rows_to_check) != len(input_prompts)
+                    or any(not valid_batch_row(i, row) for i, row in enumerate(rows_to_check))
+                    or [
+                        media_id
+                        for row in cast("list[dict[str, Any]]", rows_to_check)
+                        for media_id in row["media_ids"]
+                    ]
+                    != all_ids
+                ):
                     return {
                         "status": "failed",
                         "task_id": task_id,
-                        "error": {
-                            "detail": "Batch completed with incomplete media IDs in checkpoint."
-                        },
+                        "error": {"detail": "Batch has incomplete or ambiguous indexed media IDs."},
                     }
+                batch_rows = cast("list[dict[str, Any]]", rows_to_check)
                 data_repo = DataRepository(store)
                 prompt_results = []
                 file_paths = []
                 cloud_uris = []
                 for index, text in enumerate(input_prompts):
                     row_images: list[dict[str, Any]] = []
-                    for media_id in all_ids[
-                        index * variation_count : (index + 1) * variation_count
-                    ]:
+                    for media_id in batch_rows[index]["media_ids"]:
                         media = data_repo.get_asset_by_flow_media_id(profile, media_id)
                         if media is None:
                             return {
@@ -503,6 +543,7 @@ async def _run_generation_task(
                         {
                             "prompt_index": index,
                             "prompt": text,
+                            "status": batch_rows[index]["status"],
                             "images": row_images,
                         }
                     )

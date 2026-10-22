@@ -12,6 +12,7 @@ from gflow_cli.api.dto import BatchSubmissionResult, GeneratedImage
 from gflow_cli.api.image import ImageRef
 from gflow_cli.api.transports.ui_automation import UiAutomationTransport
 from gflow_cli.data.store import DataStore
+from gflow_cli.errors import GFlowError
 from gflow_cli.mcp.tools import _TokenBucket, gflow_generate_image
 
 PROJECT = "a4d4d475-9b4c-4c63-b46f-cec081c8267c"
@@ -120,6 +121,66 @@ async def test_queue_worker_multi_prompt_returns_every_media_and_file(tmp_path: 
         assert row["images"][0]["flow_media_id"] == MEDIA_IDS[index]
         assert Path(row["images"][0]["files"][0]).is_file()
     assert len(result["files"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_batch_returns_only_successful_media_with_exact_indexes(
+    tmp_path: Path,
+) -> None:
+    """An RPC failure at index 0 must never reassign the image from index 1."""
+    db_path = tmp_path / "queue.db"
+    with DataStore.open(db_path):
+        pass
+    profile_dir = tmp_path / "profile_testprof"
+    profile_dir.mkdir()
+    settings = SimpleNamespace(
+        resolved_db_path=lambda: db_path,
+        profile_subdir=lambda _: profile_dir,
+        headless=True,
+        transport=None,
+        output_dir=tmp_path / "output",
+        history_prompts=False,
+        storage_uri=None,
+    )
+    client = FakeFlowClient()
+
+    async def partial_pipeline(*, project_id: str, prompts: list, jitter_range: tuple) -> list:
+        results = await client._pipeline(
+            project_id=project_id, prompts=prompts, jitter_range=jitter_range
+        )
+        results[0] = BatchSubmissionResult(
+            status="fail",
+            project_id=PROJECT,
+            prompt_idx=0,
+            prompt_hash="hash",
+            error=GFlowError(detail="Remote image generation error", route="image_pipeline"),
+        )
+        return results
+
+    client.transport.generate_images_pipelined = AsyncMock(side_effect=partial_pipeline)  # type: ignore[method-assign]
+    with (
+        patch("gflow_cli.mcp.tools._resolve_and_validate_profile", return_value="testprof"),
+        patch("gflow_cli.mcp.tools._rate_limiter", _TokenBucket()),
+        patch("gflow_cli.mcp.tools.get_settings", return_value=settings),
+        patch("gflow_cli.worker.daemon.get_settings", return_value=settings),
+        patch("gflow_cli.image_batch.FlowApiClient", return_value=client),
+    ):
+        result = await gflow_generate_image(
+            prompts=PROMPTS, project=PROJECT, profile="testprof", aspect="9:16"
+        )
+
+    assert result["status"] == "completed", result
+    assert result["flow_media_id"] == MEDIA_IDS[1]
+    assert len(result["prompt_results"]) == 2
+    assert result["prompt_results"][0] == {
+        "prompt_index": 0,
+        "prompt": PROMPTS[0],
+        "status": "failed",
+        "images": [],
+    }
+    assert result["prompt_results"][1]["status"] == "ok"
+    assert result["prompt_results"][1]["images"][0]["flow_media_id"] == MEDIA_IDS[1]
+    assert len(result["files"]) == 1
 
 
 @pytest.mark.asyncio

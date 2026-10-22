@@ -166,6 +166,32 @@ async def test_reference_response_can_prepend_the_mention_to_prompt(
     assert results[0].images[0].media_name == "generated-media"
 
 
+async def test_pipeline_waits_60_seconds_for_submit_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy Flow composer needs longer than the old 12 s submit-ack deadline."""
+    import gflow_cli.api.transports.migrated_image_pipeline as mod
+
+    collector = ImageBatchCollector((GenerateImageRequest(prompt="unique pipeline prompt"),))
+    observed: list[float] = []
+
+    async def fake_wait_for(awaitable: object, *, timeout: float) -> None:
+        observed.append(timeout)
+        awaitable.close()
+
+    monkeypatch.setattr(mod.asyncio, "wait_for", fake_wait_for)
+    await collector.await_submission(0)
+    assert observed == [60.0]
+
+
+def test_pipeline_browser_step_timeouts_are_increased() -> None:
+    import gflow_cli.api.transports.migrated_image_pipeline as mod
+
+    assert mod.PIPELINE_EDITOR_WAIT_MS == 30_000
+    assert mod.PIPELINE_SUBMIT_VISIBLE_WAIT_MS == 30_000
+    assert mod.PIPELINE_SUBMIT_CLICK_WAIT_MS == 20_000
+
+
 async def test_missing_response_is_failure_not_wrong_attribution() -> None:
     collector = ImageBatchCollector((GenerateImageRequest(prompt="a"),))
     collector.observe_request(_request("a"))
