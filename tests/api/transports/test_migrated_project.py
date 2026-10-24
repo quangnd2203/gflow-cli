@@ -89,6 +89,9 @@ class FakePage:
         self.navigate_on_create: str | None = None
         self._handlers: list[Any] = []
         self.keyboard = self
+        self.binding: Any = None
+        self.capture_body: str | None = None
+        self.eval_calls = 0
 
     async def goto(self, url: str, **_: Any) -> None:
         self.gotos.append(url)
@@ -97,6 +100,16 @@ class FakePage:
     async def reload(self, **_: Any) -> None:
         self.reload_count += 1
         self.current_title = self.server_title
+
+    async def wait_for_url(self, pattern: Any, **_: Any) -> None:
+        if not pattern.search(self.url):
+            raise mc.PlaywrightTimeoutError("no navigation to a project")
+
+    async def expose_binding(self, name: str, callback: Any) -> None:
+        self.binding = callback
+
+    async def evaluate(self, script: str, arg: Any = None) -> None:
+        self.eval_calls += 1
 
     def locator(self, sel: str) -> _Loc:
         return _Loc(self, sel)
@@ -114,6 +127,8 @@ class FakePage:
             return
         if self.persist_rename_on_enter and reply == self.on_enter:
             self.server_title = self.filled or ""
+        if self.capture_body and self.binding and reply[0].endswith("rpcids=jHPbke"):
+            self.binding(None, self.capture_body)
         for h in list(self._handlers):
             await h(_Response(*reply))
         if self.navigate_on_create:
@@ -169,6 +184,63 @@ async def test_create_with_no_reply_times_out() -> None:
 
     with pytest.raises(TransportTimeoutError, match=mc.CREATE_PROJECT_RPC):
         await mc.create_project(page, "x", timeout_s=0.1)  # type: ignore[arg-type]
+
+
+async def test_create_lost_reply_but_project_persisted_recovers() -> None:
+    """A real project created during the click must not become a false timeout."""
+    page = _page_creating(title="my film")
+    page.on_click[mc.NEW_PROJECT_BUTTON] = (
+        _batch(mc.CREATE_PROJECT_RPC),
+        "__UNREADABLE__",
+    )
+    page.server_title = "my film"
+
+    info = await mc.create_project(page, "my film", timeout_s=0.02)  # type: ignore[arg-type]
+
+    assert info.project_id == PID
+    assert info.title == "my film"
+    assert page.reload_count == 1
+    assert page.clicks == [mc.NEW_PROJECT_BUTTON]
+
+
+async def test_create_in_page_fetch_capture_survives_unreadable_playwright_reply() -> None:
+    page = _page_creating(title="my film")
+    page.capture_body = _frame(mc.CREATE_PROJECT_RPC, [PID, ["my film"]])
+    page.on_click[mc.NEW_PROJECT_BUTTON] = (
+        _batch(mc.CREATE_PROJECT_RPC),
+        "__UNREADABLE__",
+    )
+
+    info = await mc.create_project(page, "my film", timeout_s=0.02)  # type: ignore[arg-type]
+
+    assert info.project_id == PID
+    assert info.title == "my film"
+    assert page.reload_count == 0
+    assert page.eval_calls >= 2  # install and restore browser interception
+
+
+async def test_create_navigation_to_non_project_does_not_recover() -> None:
+    page = _page_creating()
+    page.on_click[mc.NEW_PROJECT_BUTTON] = (
+        _batch(mc.CREATE_PROJECT_RPC),
+        "__UNREADABLE__",
+    )
+    page.navigate_on_create = "https://flow.google.com/"
+
+    with pytest.raises(TransportTimeoutError):
+        await mc.create_project(page, "my film", timeout_s=0.02)  # type: ignore[arg-type]
+
+
+async def test_create_project_url_without_persisted_editor_does_not_recover() -> None:
+    page = _page_creating()
+    page.on_click[mc.NEW_PROJECT_BUTTON] = (
+        _batch(mc.CREATE_PROJECT_RPC),
+        "__UNREADABLE__",
+    )
+    page.present[mc.PROJECT_TITLE_INPUT] = False
+
+    with pytest.raises(TransportTimeoutError):
+        await mc.create_project(page, "my film", timeout_s=0.02)  # type: ignore[arg-type]
 
 
 async def test_create_reply_without_a_project_id_is_a_wire_format_error() -> None:

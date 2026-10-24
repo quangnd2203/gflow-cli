@@ -3393,6 +3393,38 @@ CREATE_PROJECT_RPC = "jHPbke"
 RENAME_PROJECT_RPC = "o8DA4"
 
 
+# Capture jHPbke's response inside Chrome before a quick page navigation can make
+# Playwright's Network.getResponseBody fail (observed on adjacent o8DA4 RPC).
+# Return the *unchanged* fetch promise to Flow; do not suppress its navigation.
+_CREATE_PROJECT_CAPTURE_JS = r"""(bindingName) => {
+    const original = window.fetch;
+    const wrapped = function(...args) {
+        let isCreate = false;
+        try {
+            const input = args[0];
+            const url = new URL(typeof input === 'string' ? input : input?.url, location.href);
+            isCreate = url.origin === location.origin &&
+                url.pathname.includes('/batchexecute') &&
+                (url.searchParams.get('rpcids') || '').split(',').includes('jHPbke');
+        } catch (_) { /* Leave Flow's request alone. */ }
+        const result = original.apply(this, args);
+        if (isCreate) {
+            result.then(response => response.clone().text().then(body => {
+                if (body.length > 64000) return;
+                const send = window[bindingName];
+                if (typeof send === 'function') return send(body);
+            }).catch(() => {})).catch(() => {});
+        }
+        return result;
+    };
+    window.fetch = wrapped;
+    window.__gflowCreateProjectRestore = () => {
+        if (window.fetch === wrapped) window.fetch = original;
+        delete window.__gflowCreateProjectRestore;
+    };
+}"""
+
+
 def _as_list_any(node: object) -> list[object]:
     return cast("list[object]", node) if isinstance(node, list) else []
 
@@ -3421,9 +3453,35 @@ async def _rpc_reply(
     *,
     timeout_s: float,
     fail_on_unreadable_target: bool = False,
+    capture_create_in_browser: bool = False,
 ) -> Any:
     """Run ``action`` and return the payload of the first ``rpcid`` frame the page gets."""
     reply: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    capture_installed = False
+
+    if capture_create_in_browser:
+        # A unique binding name prevents collisions if the same pooled Page is
+        # used for more than one project. The binding survives page navigation.
+        binding_name = f"__gflowCreateReply_{uuid4().hex}"
+
+        def on_in_page_capture(_source: Any, raw_body: object) -> None:
+            if reply.done() or not isinstance(raw_body, str) or len(raw_body) > 64_000:
+                return
+            for rid, payload in parse_frames(raw_body):
+                if rid == rpcid and not reply.done():
+                    reply.set_result(payload)
+                    log.info("migrated.project_create_reply_in_page", rpcid=rpcid)
+                    return
+
+        try:
+            await page.expose_binding(binding_name, on_in_page_capture)  # pyright: ignore[reportUnknownMemberType]
+            await page.evaluate(_CREATE_PROJECT_CAPTURE_JS, binding_name)
+            capture_installed = True
+        except Exception as exc:  # noqa: BLE001 - preserve original RPC listener
+            log.warning(
+                "migrated.project_create_capture_unavailable",
+                error_class=type(exc).__name__,
+            )
 
     async def on_response(response: Any) -> None:
         if reply.done() or "batchexecute" not in str(getattr(response, "url", "")):
@@ -3431,23 +3489,30 @@ async def _rpc_reply(
         try:
             text = await response.text()
         except Exception as exc:
-            # Chrome can report an HTTP 200 rename and commit it server-side
-            # while Playwright cannot read the body after navigation. Signal
-            # that promptly for rename only; its caller verifies the *saved*
-            # title on a fresh page before claiming success.
+            # Chrome can commit a create/rename request and then lose its body
+            # on navigation (HTTP 200 + Network.getResponseBody failure).
+            # Signal promptly; callers recover only after verifying persisted state.
             if (
                 fail_on_unreadable_target
                 and _rpcid(str(response.url)) == rpcid
                 and not reply.done()
             ):
-                reply.set_exception(
-                    TransportTimeoutError(
-                        detail=f"flow.google.com {rpcid} response body unreadable on "
-                        f"{safe_page_url(page.url)} (host=migrated)"
-                    )
+                error = TransportTimeoutError(
+                    detail=f"flow.google.com {rpcid} response body unreadable on "
+                    f"{safe_page_url(page.url)} (host=migrated)"
                 )
+                if capture_create_in_browser and capture_installed:
+                    # Chrome's fetch clone may still be reading: give it a brief
+                    # opportunity to settle before reporting an unreadable body.
+                    asyncio.get_running_loop().call_later(
+                        0.25, lambda: None if reply.done() else reply.set_exception(error)
+                    )
+                else:
+                    reply.set_exception(error)
                 log.warning(
-                    "migrated.project_rename_reply_unreadable",
+                    "migrated.project_create_reply_unreadable"
+                    if capture_create_in_browser
+                    else "migrated.project_rename_reply_unreadable",
                     rpcid=rpcid,
                     error_class=type(exc).__name__,
                 )
@@ -3470,6 +3535,68 @@ async def _rpc_reply(
             ) from e
     finally:
         page.remove_listener("response", on_response)
+        if capture_installed:
+            try:
+                await page.evaluate("() => window.__gflowCreateProjectRestore?.()")
+            except Exception:  # noqa: BLE001 - navigation may have destroyed this document
+                pass
+
+
+def _project_id_from_page_url(page: Page) -> str | None:
+    """Only accept the canonical Flow project route, not a redirect or edit URL."""
+    parsed = urlsplit(str(getattr(page, "url", "")))
+    if parsed.scheme != "https" or parsed.hostname != "flow.google.com":
+        return None
+    match = re.fullmatch(r"/project/([0-9a-fA-F-]{36})/?", parsed.path)
+    project_id = match.group(1) if match else None
+    return project_id if project_id and UUID_RE.fullmatch(project_id) else None
+
+
+async def _verify_created_project_after_rpc_failure(page: Page, timeout_s: float) -> str | None:
+    """Recover only if a fresh server load shows an actual project title input.
+
+    The SPA may have optimistically navigated before persisting; a URL by itself
+    is not proof. Never click Add a second time.
+    """
+    project_id = _project_id_from_page_url(page)
+    if not project_id:
+        # The RPC can finish (or become unreadable) before Flow's navigation.
+        # Give that *existing* click time to land; never issue another click.
+        try:
+            await page.wait_for_url(
+                re.compile(r"^https://flow\.google\.com/project/[0-9a-fA-F-]{36}/?$"),
+                wait_until="domcontentloaded",
+                timeout=max(1, int(min(timeout_s, 5.0) * 1000)),
+            )
+        except PlaywrightTimeoutError:
+            return None
+        project_id = _project_id_from_page_url(page)
+        if not project_id:
+            return None
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=20_000)
+        if _project_id_from_page_url(page) != project_id:
+            return None
+        field = await _wait_anchor(
+            page,
+            PROJECT_TITLE_INPUT,
+            named="persisted project title input",
+            requested=MIGRATED_PROJECT_URL.format(project_id=project_id),
+            at="migrated.create_project.verify",
+            timeout_s=min(timeout_s, 10.0),
+        )
+        persisted_title = await field.input_value()
+        if not isinstance(persisted_title, str) or not persisted_title.strip():
+            return None
+    except Exception as exc:  # noqa: BLE001 - fail closed, re-raise original RPC error
+        log.warning(
+            "migrated.project_create_verification_failed",
+            project_id=project_id,
+            error_class=type(exc).__name__,
+        )
+        return None
+    log.info("migrated.project_create_verified_after_rpc_error", project_id=project_id)
+    return project_id
 
 
 async def create_project(page: Page, title: str, *, timeout_s: float = 30.0) -> ProjectInfo:
@@ -3486,19 +3613,32 @@ async def create_project(page: Page, title: str, *, timeout_s: float = 30.0) -> 
         at="migrated.create_project",
         timeout_s=timeout_s,
     )
-    payload = await _rpc_reply(
-        page, CREATE_PROJECT_RPC, lambda: button.click(timeout=15_000), timeout_s=timeout_s
-    )
-    reply = _as_list_any(payload)
-    project_id: object = reply[0] if reply else None
-    if not isinstance(project_id, str) or not UUID_RE.fullmatch(project_id):
-        raise WireFormatError(
-            detail=f"{CREATE_PROJECT_RPC} reply carried no project id: {str(payload)[:200]}",
-            route=f"batchexecute:{CREATE_PROJECT_RPC}",
+    try:
+        payload = await _rpc_reply(
+            page,
+            CREATE_PROJECT_RPC,
+            lambda: button.click(timeout=15_000),
+            timeout_s=timeout_s,
+            fail_on_unreadable_target=True,
+            capture_create_in_browser=True,
         )
+    except TransportTimeoutError:
+        recovered_id = await _verify_created_project_after_rpc_failure(page, timeout_s)
+        if recovered_id is None:
+            raise
+        project_id = recovered_id
+        created: object = None  # rename_project will verify or set the requested title.
+    else:
+        reply = _as_list_any(payload)
+        project_id = reply[0] if reply else None
+        if not isinstance(project_id, str) or not UUID_RE.fullmatch(project_id):
+            raise WireFormatError(
+                detail=f"{CREATE_PROJECT_RPC} reply carried no project id: {str(payload)[:200]}",
+                route=f"batchexecute:{CREATE_PROJECT_RPC}",
+            )
+        names = _as_list_any(reply[1]) if len(reply) > 1 else []
+        created = names[0] if names else None
     log.info("migrated.project_created", project_id=project_id)
-    names = _as_list_any(reply[1]) if len(reply) > 1 else []
-    created: object = names[0] if names else None
     if title and created != title:
         await rename_project(page, project_id, title, timeout_s=timeout_s)
         created = title

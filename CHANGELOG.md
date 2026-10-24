@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Migrated Flow project creation no longer falsely times out after the browser creates
+  and opens a project.** The `jHPbke` response is captured from a cloned Fetch
+  response inside Chrome when Playwright loses its response body on navigation.
+  If both readers miss it, gflow waits for the project route and verifies the
+  persisted project on a fresh server load before continuing. It never clicks
+  the Create button twice or trusts navigation alone. Live E2E verified with
+  forced unreadable response bodies, and with both response-capture paths disabled.
 - **MCP generation results include cloud storage URIs.** Completed image and video
   responses now return `cloud_uris` from the asset catalog alongside local `files`.
 - **`gflow image t2i --project-name` titles a multi-prompt run's project (#975).** With

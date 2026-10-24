@@ -83,6 +83,79 @@ async def _read_title(profile_dir: Path, project_id: str) -> str:
 
 
 @pytest.mark.e2e_auth
+async def test_project_create_recovers_when_playwright_body_is_unreadable(
+    e2e_profile_dir: Path,
+    auto_host: None,
+    monkeypatch: pytest.MonkeyPatch,
+    install_log_capture: structlog.testing.LogCapture,
+) -> None:
+    """A live jHPbke 200 with lost Playwright body must still yield a verified project.
+
+    The interception affects only Response.text on the create RPC; the browser's
+    native fetch and response are untouched. Requires a real signed-in Flow.
+    """
+    from playwright.async_api import Response
+
+    original_text = Response.text
+
+    async def broken_create_body(response: Response) -> str:
+        if migrated_composer.CREATE_PROJECT_RPC in response.url:
+            raise RuntimeError("forced Network.getResponseBody unavailable")
+        return await original_text(response)
+
+    monkeypatch.setattr(Response, "text", broken_create_body)
+    title = _title("lost-body")
+    async with FlowApiClient(profile_dir=e2e_profile_dir) as client:
+        page = client._page  # noqa: SLF001 - verify the real browser page
+        assert page is not None
+        created = await migrated_composer.create_project(page, title, timeout_s=12.0)
+
+    assert _UUID.fullmatch(created.project_id), created
+    assert created.title == title
+    events = {str(entry.get("event")) for entry in install_log_capture.entries}
+    assert "migrated.project_create_reply_in_page" in events
+    assert await _read_title(e2e_profile_dir, created.project_id) == title
+
+
+@pytest.mark.e2e_auth
+async def test_project_create_recovers_from_navigation_without_any_rpc_body(
+    e2e_profile_dir: Path,
+    auto_host: None,
+    monkeypatch: pytest.MonkeyPatch,
+    install_log_capture: structlog.testing.LogCapture,
+) -> None:
+    """Fallback verifies the persisted project when both response readers fail."""
+    from playwright.async_api import Response
+
+    original_text = Response.text
+
+    async def broken_create_body(response: Response) -> str:
+        if migrated_composer.CREATE_PROJECT_RPC in response.url:
+            raise RuntimeError("forced Network.getResponseBody unavailable")
+        return await original_text(response)
+
+    monkeypatch.setattr(Response, "text", broken_create_body)
+    # Disable just the supplementary in-browser capture for this E2E arm.
+    monkeypatch.setattr(
+        migrated_composer,
+        "_CREATE_PROJECT_CAPTURE_JS",
+        "() => { throw new Error('controlled E2E capture failure'); }",
+    )
+
+    title = _title("verified-navigation")
+    async with FlowApiClient(profile_dir=e2e_profile_dir) as client:
+        page = client._page  # noqa: SLF001
+        assert page is not None
+        created = await migrated_composer.create_project(page, title, timeout_s=12.0)
+
+    assert _UUID.fullmatch(created.project_id), created
+    assert created.title == title
+    events = {str(entry.get("event")) for entry in install_log_capture.entries}
+    assert "migrated.project_create_verified_after_rpc_error" in events
+    assert await _read_title(e2e_profile_dir, created.project_id) == title
+
+
+@pytest.mark.e2e_auth
 async def test_cli_project_create_and_rename_land_on_flow(
     e2e_env: dict[str, str], e2e_profile_dir: Path, auto_host: None
 ) -> None:
