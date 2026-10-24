@@ -193,21 +193,28 @@ gflow image i2i "make it cinematic" --ref "$UUID"
 
 ## `gflow image upscale`
 
-Upscale a **platform-generated** image to 2K or 4K (the same 1K/2K/4K options Flow's
-download menu offers) and save it locally. Uploaded images are not supported.
+Upscale **platform-generated** images to 2K or 4K (the same 1K/2K/4K options Flow's
+download menu offers). Pass one image ID or up to 50 IDs per CLI invocation; multiple
+images run sequentially in the same browser session. Uploaded images are not supported.
 
 > **When Flow serves `flow.google.com` (#639):** gflow drives the image detail view's download
-> menu, which answers on the `SPrCad` batchexecute wire with the upscaled JPEG. Verified for 2K
-> on 2026-10-07; 4K was seen only as a disabled option (exit 22) on the account used.
+> menu, which answers on the `SPrCad` batchexecute wire with the upscaled JPEG. For
+> reliable downloads, gflow captures a copy of that response in the browser's Fetch
+> stream before Chrome can discard its body (`Network.getResponseBody` may otherwise
+> intermittently fail with `ERR_ABORTED` after HTTP 200). The clone and download
+> interception are removed after each upscale. Verified for 2K on 2026-10-07;
+> 4K was seen only as a disabled option (exit 22) on the account used.
 
 ```text
-gflow image upscale MEDIA_ID --scale 2k|4k [OPTIONS]
+gflow image upscale [MEDIA_ID] --scale 2k|4k [--media-ids IDS] [OPTIONS]
 
 Arguments:
-  MEDIA_ID                  UUID of a Flow-generated image (find one with
-                            `gflow data list images`).
+  MEDIA_ID                  One UUID, comma-separated UUIDs, or a JSON array of UUIDs
+                            (find IDs with `gflow data list images`).
 
 Options:
+  --media-ids IDS            Alternative to MEDIA_ID: one UUID, a comma-separated
+                            string, or a JSON array of UUID strings (max 50).
   --scale 2k|4k             Target resolution (required). 4k requires a Flow Ultra
                             subscription; 1k is the original (no upscale).
   --project ID              Project that owns the image. Resolved from the local
@@ -223,10 +230,16 @@ Examples:
 ```bash
 gflow image upscale 3a56bb5e-92a2-44f4-9992-3c6a9bf0cd14 --scale 2k
 gflow image upscale <mediaId> --scale 2k --project <projectId>
+gflow image upscale '<id1>,<id2>' --scale 2k
+gflow image upscale --media-ids '["<id1>","<id2>"]' --scale 2k
 ```
 
 Notes:
 
+- **Batch semantics:** one CLI invocation, one browser client, one Flow upscale request
+  per image; errors are reported by media ID, and remaining images are attempted.
+  If any fail, the command exits nonzero after displaying the number saved.
+  An explicit `--project` applies to all IDs; omit it to resolve each ID from the catalog.
 - **Credit-free** — upscaling is an image operation and spends no credits.
 - **4K is Ultra-only.** On a non-Ultra account a 4K request fails with exit code 22
   (`UpscaleUnavailableError`, detected from the disabled UI state or 403) and a hint to use `--scale 2k` or upgrade.

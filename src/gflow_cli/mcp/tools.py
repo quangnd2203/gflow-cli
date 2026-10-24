@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import time
 import uuid
 import weakref
@@ -1675,8 +1676,10 @@ async def gflow_download_media(
 @server.tool(
     name="gflow_upscale_image",
     description=(
-        "Upscale a platform-generated Flow image to 2K or 4K and save it locally. "
-        "media_id is the UUID of the image to upscale. "
+        "Upscale Flow-generated images to 2K/4K. Pass media_id for a single image, "
+        "or media_ids for a batch of 1-50 images (list of UUIDs, JSON-array string, "
+        "or comma-separated string). Batch runs sequentially in one Chrome session "
+        "and reports per-image results. "
         "scale is '2k' or '4k' (4k requires Ultra subscription; Pro/Plus accounts support 2k). "
         "project is optional (resolved from the local catalog when omitted). "
         "out_dir is the output directory (defaults to configured images directory). "
@@ -1686,24 +1689,37 @@ async def gflow_download_media(
 )
 @_guarded
 async def gflow_upscale_image(
-    media_id: str,
+    media_id: str | None = None,
     scale: str = "2k",
     project: str | None = None,
     out_dir: str | None = None,
     profile: str = _DEFAULT_PROFILE,
+    media_ids: str | list[str] | None = None,
 ) -> dict[str, Any]:
-    """Upscale a platform-generated image to 2K or 4K.
+    """Upscale one or multiple platform-generated images to 2K or 4K.
 
     Args:
-        media_id: The Flow media ID (UUID) of the generated image.
+        media_id: One Flow image UUID (legacy, single-result response).
+        media_ids: Up to 50 IDs as list, JSON-array string, or comma-separated string.
+            Mutually exclusive with media_id; returns per-image batch results.
         scale: Target resolution: '2k' or '4k' (4k is Ultra-only).
         project: Project UUID that owns the media. Resolved from local catalog when omitted.
         out_dir: Output directory (defaults to configured images directory).
         profile: Profile name (overrides default).
 
     Returns:
-        Dict with status, media_id, project_id, scale, path, and size bytes.
+        media_id keeps the legacy status/path/bytes object. media_ids returns
+        a summary and per-image results[] with status/path/bytes or an error.
     """
+    if (media_id is None) == (media_ids is None):
+        return _bad_param("Ambiguous Media IDs", "Pass exactly one of media_id or media_ids.")
+    batch_ids: list[str] | None = None
+    if media_ids is not None:
+        normalized = _normalize_upscale_media_ids(media_ids)
+        if isinstance(normalized, dict):
+            return normalized
+        batch_ids = normalized
+
     resolved = _resolve_and_validate_profile(profile)
     if isinstance(resolved, dict):
         return resolved
@@ -1713,6 +1729,16 @@ async def gflow_upscale_image(
     except ValueError as exc:
         return _bad_param("Invalid Scale", str(exc))
 
+    if batch_ids is not None:
+        return await _run_upscale_image_batch_tool(
+            media_ids=batch_ids,
+            profile=resolved,
+            project=project,
+            out_dir=out_dir,
+            scale_label=scale.strip().lower(),
+            resolution=resolution,
+        )
+    assert media_id is not None
     return await _run_upscale_tool(
         kind="image",
         profile=resolved,
@@ -1728,6 +1754,166 @@ async def gflow_upscale_image(
             out_path=out_path,
         ),
     )
+
+
+def _normalize_upscale_media_ids(
+    raw: str | list[str],
+) -> list[str] | dict[str, Any]:
+    """Parse the MCP array/string input without changing the legacy media_id field."""
+    values: object = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith(("[", '"')):
+            try:
+                values = json.loads(text)
+            except json.JSONDecodeError:
+                return _bad_param("Invalid Media IDs", "Malformed JSON media_ids.")
+        else:
+            values = text
+    if isinstance(values, str):
+        values = values.split(",")
+    if not isinstance(values, list):
+        return _bad_param("Invalid Media IDs", "Use a UUID, CSV string, or JSON array.")
+    entries = cast("list[object]", values)
+    if not 1 <= len(entries) <= 50:
+        return _bad_param("Invalid Media IDs", "Provide 1-50 media IDs.")
+    ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, str) or not is_media_uuid(entry.strip()):
+            return _bad_param("Invalid Media ID", "Every media_ids entry must be a UUID.")
+        ids.append(entry.strip())
+    if len(ids) != len(set(ids)):
+        return _bad_param("Duplicate Media IDs", "Each image can appear only once.")
+    return ids
+
+
+async def _run_upscale_image_batch_tool(
+    *,
+    media_ids: list[str],
+    profile: str,
+    project: str | None,
+    out_dir: str | None,
+    scale_label: str,
+    resolution: TargetResolution,
+) -> dict[str, Any]:
+    """Run one SPrCad per image inside one leased browser session.
+
+    Resolve all ownership before launching Chrome; continue past per-image
+    Flow failures, preserving successful outputs and structured error details.
+    """
+    if (project_error := _validate_project(project)) is not None:
+        return project_error
+    projects: list[tuple[str, str]] = []
+    for media_id in media_ids:
+        project_id = project or lookup_project_in_catalog(media_id, profile)
+        if not project_id:
+            return _bad_param(
+                "Project Required",
+                f"Could not resolve the owning project for media {media_id!r} "
+                f"(profile {profile!r}). Pass project explicitly.",
+            )
+        projects.append((media_id, project_id))
+
+    settings = get_settings()
+    output_root = Path(out_dir) if out_dir is not None else settings.output_dir
+    profile_dir = settings.profile_subdir(profile)
+    from datetime import date
+
+    from gflow_cli.storage import is_cloud_path
+
+    log.info(
+        "mcp.tool.upscale_image_batch",
+        count=len(projects),
+        scale=scale_label,
+        profile=profile,
+    )
+    results: list[dict[str, Any]] = []
+    async with (
+        _profile_lock(profile),
+        FlowApiClient(
+            profile_dir=profile_dir,
+            headless=settings.headless,
+            out_dir=output_root,
+        ) as client,
+    ):
+        for media_id, project_id in projects:
+            out_path = (
+                output_root / "images" / date.today().isoformat() / f"{media_id}_{scale_label}.png"
+            )
+            try:
+                target = await client.upsample_image(
+                    media_id=media_id,
+                    project_id=project_id,
+                    target_resolution=resolution,
+                    out_path=out_path,
+                )
+            except GFlowError as exc:
+                log.warning(
+                    "mcp.tool.upscale_image_batch_item_failed",
+                    media_id=media_id,
+                    error_type=type(exc).__name__,
+                )
+                results.append(
+                    {
+                        "status": "error",
+                        "media_id": media_id,
+                        "project_id": project_id,
+                        "scale": scale_label,
+                        "error": _gflow_error_dict(exc),
+                    }
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - keep other images recoverable
+                log.exception(
+                    "mcp.tool.upscale_image_batch_item_unexpected",
+                    media_id=media_id,
+                    exc_info=exc,
+                )
+                results.append(
+                    {
+                        "status": "error",
+                        "media_id": media_id,
+                        "project_id": project_id,
+                        "scale": scale_label,
+                        "error": _masked_unexpected_dict(exc),
+                    }
+                )
+                continue
+
+            target_path = Path(str(target))
+            file_bytes = (
+                target_path.stat().st_size
+                if not is_cloud_path(target) and target_path.is_file()
+                else 0
+            )
+            results.append(
+                {
+                    "status": "ok",
+                    "media_id": media_id,
+                    "project_id": project_id,
+                    "scale": scale_label,
+                    "path": str(target),
+                    "bytes": file_bytes,
+                }
+            )
+
+    succeeded = sum(entry["status"] == "ok" for entry in results)
+    failed = len(results) - succeeded
+    status = "ok" if not failed else "failed" if not succeeded else "partial"
+    log.info(
+        "mcp.tool.upscale_image_batch_completed",
+        status=status,
+        succeeded=succeeded,
+        failed=failed,
+    )
+    return {
+        "status": status,
+        "scale": scale_label,
+        "total": len(results),
+        "succeeded": succeeded,
+        "failed": failed,
+        "results": results,
+    }
 
 
 @server.tool(

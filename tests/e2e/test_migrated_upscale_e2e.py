@@ -135,6 +135,113 @@ async def test_mcp_upscale_image_2k_e2e(
         assert max(im.size) >= _2K_LONG_SIDE_FLOOR, f"not 2K: {im.size}"
 
 
+@pytest.mark.e2e_image
+@pytest.mark.asyncio
+async def test_mcp_three_image_upscale_batch_e2e(
+    e2e_profile_dir: Path,
+    real_catalog: None,
+    tmp_path: Path,
+) -> None:
+    """Live MCP batch: three real media IDs, one client, three validated 2K files."""
+    from gflow_cli.mcp import tools
+
+    profile = os.environ.get("GFLOW_CLI_E2E_PROFILE", "").strip()
+    if not profile:
+        pytest.skip("GFLOW_CLI_E2E_PROFILE required")
+    rows = list_images(
+        db_path=get_settings().resolved_db_path(), profile=profile, limit=50, offset=0
+    )
+    groups: dict[str, list[str]] = {}
+    for row in rows:
+        if row.project_id:
+            groups.setdefault(row.project_id, []).append(row.media_id)
+    selected = next(((pid, mids[:3]) for pid, mids in groups.items() if len(mids) >= 3), None)
+    if selected is None:
+        pytest.skip("requires three catalogued images in one Flow project")
+    project_id, media_ids = selected
+
+    result: dict[str, Any] = await tools.gflow_upscale_image(
+        media_ids=media_ids,
+        project=project_id,
+        scale="2k",
+        profile=profile,
+        out_dir=str(tmp_path),
+    )
+    assert result.get("status") == "ok", f"MCP batch upscale failed: {result}"
+    assert result["total"] == result["succeeded"] == 3
+    assert result["failed"] == 0
+    assert [item["media_id"] for item in result["results"]] == media_ids
+    for item in result["results"]:
+        assert item["status"] == "ok"
+        saved = Path(item["path"])
+        assert saved.is_file(), f"reported {saved} but nothing written"
+        with Image.open(saved) as image:
+            assert max(image.size) >= _2K_LONG_SIDE_FLOOR
+
+
+@pytest.mark.e2e_image
+def test_cli_two_image_upscale_batch_e2e(
+    e2e_profile_dir: Path,
+    real_catalog: None,
+    tmp_path: Path,
+) -> None:
+    """Live CLI batch uses one session and saves two independent 2K files ($0 credits)."""
+    import json
+
+    from click.testing import CliRunner
+
+    from gflow_cli.cli import main
+
+    profile = os.environ.get("GFLOW_CLI_E2E_PROFILE", "").strip()
+    if not profile:
+        pytest.skip("GFLOW_CLI_E2E_PROFILE required")
+
+    rows = list_images(
+        db_path=get_settings().resolved_db_path(),
+        profile=profile,
+        limit=50,
+        offset=0,
+    )
+    pair = next(
+        (
+            (first, second)
+            for index, first in enumerate(rows)
+            for second in rows[index + 1 :]
+            if first.project_id and first.project_id == second.project_id
+        ),
+        None,
+    )
+    if pair is None:
+        pytest.skip("requires two catalogued images in the same Flow project")
+
+    first, second = pair
+    result = CliRunner().invoke(
+        main,
+        [
+            "image",
+            "upscale",
+            "--media-ids",
+            json.dumps([first.media_id, second.media_id]),
+            "--scale",
+            "2k",
+            "--project",
+            str(first.project_id),
+            "--profile",
+            profile,
+            "--out",
+            str(tmp_path),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "2/2 saved" in result.output
+    for media_id in (first.media_id, second.media_id):
+        saved = list((tmp_path / "images").rglob(f"{media_id}_2k.*"))
+        assert len(saved) == 1, f"missing or duplicate output for {media_id}"
+        with Image.open(saved[0]) as image:
+            assert max(image.size) >= _2K_LONG_SIDE_FLOOR
+
+
 @pytest.mark.e2e_video
 @pytest.mark.asyncio
 async def test_migrated_video_upscale_1080p_e2e(

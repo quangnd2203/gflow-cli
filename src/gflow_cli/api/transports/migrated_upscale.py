@@ -27,9 +27,7 @@ from gflow_cli.errors import (
 from gflow_cli.paths import extension_from_magic
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Awaitable, Callable
-
-    from playwright.async_api import Locator, Page, Response
+    from playwright.async_api import Locator, Page
 
 log = structlog.get_logger(__name__)
 
@@ -181,30 +179,86 @@ def _sprcad_b64(text: str) -> str | None:
     return None
 
 
-def _sprcad_listener(found_b64: asyncio.Future[str]) -> Callable[[Response], Awaitable[None]]:
-    """A response listener that settles ``found_b64`` from the first ``SPrCad`` reply."""
+# Capture in the page's Fetch stream, *before* Chrome discards a download response.
+# Live A/B, 2026-10-23: unmodified Playwright response.text() intermittently raised
+# Network.getResponseBody/No data; that exact SPrCad request finished ERR_ABORTED
+# after HTTP 200. A simultaneous response.clone().text() inside Chrome read the
+# complete ~1 MB RPC payload in 12/12 trials. No image bytes enter browser logs.
+_SPRCAD_CAPTURE_INSTALL = r"""() => {
+    const oldFetch = window.fetch;
+    const oldAnchorClick = HTMLAnchorElement.prototype.click;
+    const result = {done: false, http_status: null, body: null, error: null};
+    const wrapper = function(...args) {
+        let relevant = false;
+        try {
+            const target = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+            const url = new URL(target, location.href);
+            relevant = url.origin === location.origin && url.pathname.includes('/batchexecute')
+                && (url.searchParams.get('rpcids') || '').split(',').includes('SPrCad');
+        } catch (_) { /* Preserve Flow's own fetch behavior. */ }
+        const promise = oldFetch.apply(this, args);
+        if (relevant && !result.seen) {
+            result.seen = true;
+            promise.then(response => {
+                result.http_status = response.status;
+                try {
+                    response.clone().text().then(body => {
+                        if (body.length > 64000000) {
+                            result.error = 'SPrCad response exceeds the 64 MB capture limit';
+                        } else {
+                            result.body = body;
+                        }
+                        result.done = true;
+                    }).catch(error => {
+                        result.error = String(error);
+                        result.done = true;
+                    });
+                } catch (error) {
+                    result.error = String(error);
+                    result.done = true;
+                }
+            }).catch(error => {
+                result.error = String(error);
+                result.done = true;
+            });
+        }
+        return promise;
+    };
+    const suppressDownload = function() {};
+    window.fetch = wrapper;
+    HTMLAnchorElement.prototype.click = suppressDownload;
+    window.__gflowUpscaleCapture = result;
+    window.__gflowUpscaleCaptureRestore = function() {
+        if (window.fetch === wrapper) window.fetch = oldFetch;
+        if (HTMLAnchorElement.prototype.click === suppressDownload) {
+            HTMLAnchorElement.prototype.click = oldAnchorClick;
+        }
+        delete window.__gflowUpscaleCapture;
+        delete window.__gflowUpscaleCaptureRestore;
+    };
+}"""
 
-    async def on_response(response: Response) -> None:
-        if "batchexecute" not in response.url or UPSCALE_RPCID not in response.url:
-            return
-        try:
-            b64_val = _sprcad_b64(await response.text())
-        except WireFormatError as exc:
-            settle_exception(found_b64, exc)
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.warning("migrated_upscale.parse_error", error=str(exc))
-            settle_exception(
-                found_b64,
-                WireFormatError(
-                    detail=f"Failed to parse SPrCad response: {exc}", route="image_upscale"
-                ),
-            )
-            return
-        if b64_val and not found_b64.done():
-            found_b64.set_result(b64_val)
 
-    return on_response
+def _sprcad_captured_b64(captured: Any) -> str:
+    """Validate the in-page HTTP response and decode its SPrCad frame in Python."""
+    if not isinstance(captured, dict):
+        raise WireFormatError(detail="Missing browser SPrCad capture", route="image_upscale")
+    response = cast("dict[str, Any]", captured)
+    if response.get("error"):
+        raise WireFormatError(
+            detail=f"Could not read SPrCad response in browser: {str(response['error'])[:200]}",
+            route="image_upscale",
+        )
+    status = response.get("http_status")
+    if status != 200:
+        raise WireFormatError(detail=f"SPrCad returned HTTP {status}", route="image_upscale")
+    body = response.get("body")
+    if not isinstance(body, str) or len(body) > 64_000_000:
+        raise WireFormatError(detail="Invalid SPrCad browser response body", route="image_upscale")
+    b64_data = _sprcad_b64(body)
+    if b64_data is None:
+        raise WireFormatError(detail="Reply did not contain an SPrCad image", route="image_upscale")
+    return b64_data
 
 
 def settle_exception(future: asyncio.Future[Any], exc: BaseException) -> None:
@@ -248,36 +302,38 @@ async def upscale_image_migrated(
     if await is_menu_item_disabled(btn_target):
         raise _unavailable_error(target_resolution)
 
-    found_b64: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-    on_response = _sprcad_listener(found_b64)
-    page.on("response", on_response)
+    # Playwright response.text() retrieves the body via Network.getResponseBody.
+    # On SPrCad the network request intermittently becomes ERR_ABORTED *after*
+    # HTTP 200, so Chrome has no body to give CDP. Clone the fetch response in
+    # the page before Flow's UI turns it into a download instead.
+    await page.evaluate(_SPRCAD_CAPTURE_INSTALL)
     try:
-        # Override anchor click and preserve original to restore later
-        await page.evaluate("""() => {
-            window._origAnchorClick = HTMLAnchorElement.prototype.click;
-            HTMLAnchorElement.prototype.click = function() {};
-        }""")
         await btn_target.click()
-
         try:
-            b64_data = await asyncio.wait_for(found_b64, timeout=timeout_s)
-        except TimeoutError as exc:
+            await page.wait_for_function(
+                "() => window.__gflowUpscaleCapture?.done === true",
+                timeout=max(1, int(timeout_s * 1000)),
+            )
+        except PlaywrightTimeoutError as exc:
             raise TransportTimeoutError(
                 detail=(
                     f"Timed out after {timeout_s}s waiting for {UPSCALE_RPCID} response from Flow"
                 ),
                 route="image_upscale",
             ) from exc
+        captured = await page.evaluate(
+            """() => {
+                const value = window.__gflowUpscaleCapture;
+                return value ? {
+                    http_status: value.http_status, body: value.body, error: value.error
+                } : null;
+            }"""
+        )
+        b64_data = _sprcad_captured_b64(captured)
     finally:
-        page.remove_listener("response", on_response)
         try:
-            await page.evaluate("""() => {
-                if (window._origAnchorClick) {
-                    HTMLAnchorElement.prototype.click = window._origAnchorClick;
-                    delete window._origAnchorClick;
-                }
-            }""")
-        except Exception:  # noqa: BLE001
+            await page.evaluate("""() => window.__gflowUpscaleCaptureRestore?.()""")
+        except Exception:  # noqa: BLE001 - page may have closed
             pass
 
     try:

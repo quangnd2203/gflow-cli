@@ -15,11 +15,12 @@ in :mod:`gflow_cli._cli_helpers` since T4b — a negative AST-based test in
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 import click
 import structlog
@@ -61,9 +62,11 @@ from gflow_cli.data.recorder import (
 from gflow_cli.data.repository import DataRepository, verified_local_path
 from gflow_cli.data.store import DataStore
 from gflow_cli.errors import (
+    BatchPartialError,
     ConfigurationError,
     DataIntegrityError,
     DataStoreError,
+    GFlowError,
 )
 from gflow_cli.image_batch import (
     ALLOWED_ASPECT_RATIOS as _ALLOWED_ASPECT_RATIOS,
@@ -591,18 +594,24 @@ async def _run_upload(
     "upscale",
     short_help="Upscale a platform-generated image to 2K or 4K.",
     help=(
-        "Upscale a Flow-generated image to 2K or 4K and save it locally.\n\n"
+        "Upscale one or more Flow-generated images to 2K or 4K.\n\n"
         "\b\n"
         "Examples:\n"
         "  gflow image upscale <mediaId> --scale 2k\n"
-        "  gflow image upscale <mediaId> --scale 4k --out ~/Downloads\n\n"
-        "MEDIA_ID is the UUID of a platform-generated image — find one with "
-        "`gflow data list images`. Only images Flow generated can be upscaled "
-        "(uploaded images are not supported). 4K requires a Flow Ultra "
-        "subscription; on other plans use --scale 2k."
+        "  gflow image upscale '<id1>,<id2>' --scale 2k\n"
+        '  gflow image upscale --media-ids \'["<id1>","<id2>"]\' --scale 2k\n\n'
+        "MEDIA_ID and --media-ids accept a single UUID, comma-separated UUIDs, "
+        "or a JSON array of UUID strings. Batch upscales run sequentially in "
+        "one browser session. Find image IDs with `gflow data list images`. "
+        "Only Flow-generated images are supported. 4K requires Flow Ultra."
     ),
 )
-@click.argument("media_id")
+@click.argument("media_id", required=False)
+@click.option(
+    "--media-ids",
+    default=None,
+    help="A UUID, comma-separated UUIDs, or a JSON array of UUIDs.",
+)
 @click.option(
     "--scale",
     required=True,
@@ -634,53 +643,107 @@ async def _run_upload(
     help="Override transport strategy (advanced).",
 )
 def upscale(
-    media_id: str,
+    media_id: str | None,
+    media_ids: str | None,
     scale: str,
     out_dir: Path | None,
     project_id: str | None,
     profile: str | None,
     transport: str | None,
 ) -> None:
-    """Upscale MEDIA_ID to the requested --scale and save it locally."""
-    # Validate scale + mediaId format before doing anything (fail fast, exit 2).
+    """Upscale a UUID or a batch of UUIDs through one Flow browser session."""
+    if media_id is not None and media_ids is not None:
+        raise click.UsageError("Pass MEDIA_ID or --media-ids, not both.")
+    raw_ids = media_ids if media_ids is not None else media_id
+    if raw_ids is None:
+        raise click.UsageError("Pass MEDIA_ID or --media-ids.")
+    parsed_ids = _parse_upscale_media_ids(
+        raw_ids, param_hint="--media-ids" if media_ids is not None else "MEDIA_ID"
+    )
     try:
         resolution = TargetResolution.from_cli(scale)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--scale") from exc
-    if not is_media_uuid(media_id):
-        raise click.BadParameter(
-            "MEDIA_ID must be a bare UUID (8-4-4-4-12 hex).", param_hint="MEDIA_ID"
-        )
 
     profile_name = _resolve_profile(profile)
-    # Resolve the owning project (catalog lookup or explicit --project) BEFORE
-    # launching the browser — no reCAPTCHA mint is spent on an unresolvable id.
-    resolved_project = _resolve_upscale_project_id(
-        media_id=media_id, explicit=project_id, profile_name=profile_name
-    )
-    # Final guard: both ids must be well-formed UUIDs (the wire requires it).
-    try:
-        UpsampleImageRequest(
-            media_id=media_id, project_id=resolved_project, target_resolution=resolution
+    # Validate all IDs and resolve all owning projects before launching Chrome.
+    pairs: list[tuple[str, str]] = []
+    for item_id in parsed_ids:
+        resolved_project = _resolve_upscale_project_id(
+            media_id=item_id, explicit=project_id, profile_name=profile_name
         )
-    except ValueError as exc:
-        raise click.BadParameter(str(exc)) from exc
+        try:
+            UpsampleImageRequest(
+                media_id=item_id, project_id=resolved_project, target_resolution=resolution
+            )
+        except ValueError as exc:
+            raise click.BadParameter(str(exc)) from exc
+        pairs.append((item_id, resolved_project))
 
     provider_dir = _make_provider_dir(profile_name)
     settings = get_settings()
-    run_with_handlers(
-        lambda: _run_upscale(
+
+    def task():
+        if len(pairs) == 1:
+            return _run_upscale(
+                profile_dir=provider_dir,
+                headless=settings.headless,
+                media_id=pairs[0][0],
+                project_id=pairs[0][1],
+                resolution=resolution,
+                scale_label=scale.strip().lower(),
+                out_dir=out_dir,
+                transport=transport,
+            )
+        return _run_upscale_batch(
             profile_dir=provider_dir,
             headless=settings.headless,
-            media_id=media_id,
-            project_id=resolved_project,
+            media_projects=pairs,
             resolution=resolution,
             scale_label=scale.strip().lower(),
             out_dir=out_dir,
             transport=transport,
-        ),
-        cli_command="image upscale",
-    )
+        )
+
+    run_with_handlers(task, cli_command="image upscale")
+
+
+def _parse_upscale_media_ids(raw: str, *, param_hint: str) -> list[str]:
+    """Normalize a single UUID, comma-separated UUIDs, or JSON array of UUIDs."""
+    value = raw.strip()
+    items: object
+    if value.startswith(("[", '"')):
+        try:
+            items = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise click.BadParameter(
+                "Invalid JSON media IDs array.", param_hint=param_hint
+            ) from exc
+    else:
+        items = value
+
+    if isinstance(items, str):
+        items = items.split(",")
+    if not isinstance(items, list):
+        raise click.BadParameter("Provide a UUID or an array of UUIDs.", param_hint=param_hint)
+    entries = cast("list[object]", items)
+    if not entries or len(entries) > 50:
+        raise click.BadParameter(
+            "Provide 1-50 media IDs as a UUID, comma-separated string, or JSON array.",
+            param_hint=param_hint,
+        )
+
+    ids: list[str] = []
+    for item in entries:
+        if not isinstance(item, str) or not is_media_uuid(item.strip()):
+            raise click.BadParameter(
+                "Each MEDIA_ID must be a bare UUID (8-4-4-4-12 hex).",
+                param_hint=param_hint,
+            )
+        ids.append(item.strip())
+    if len(ids) != len(set(ids)):
+        raise click.BadParameter("Duplicate media IDs are not allowed.", param_hint=param_hint)
+    return ids
 
 
 def _lookup_project_in_catalog(media_id: str, profile_name: str) -> str | None:
@@ -765,6 +828,63 @@ async def _run_upscale(
             out_path=out_path,
         )
         console.print(f"[bold green]Saved:[/bold green] {safe_path_text(target)}")
+
+
+async def _run_upscale_batch(
+    *,
+    profile_dir: Path,
+    headless: bool,
+    media_projects: list[tuple[str, str]],
+    resolution: TargetResolution,
+    scale_label: str,
+    out_dir: Path | None,
+    transport: str | None = None,
+) -> None:
+    """Run SPrCad once per media ID, reusing one authenticated browser client.
+
+    A per-image Flow failure is reported and does not prevent later IDs from
+    completing. Programmer errors and interrupts still fail immediately.
+    """
+    settings = get_settings()
+    output_root = out_dir if out_dir is not None else settings.output_dir
+    saved: list[str] = []
+    failures: list[str] = []
+    total = len(media_projects)
+    async with FlowApiClient(
+        profile_dir=profile_dir,
+        headless=headless,
+        transport=transport,
+        out_dir=output_root,
+    ) as client:
+        for index, (media_id, project_id) in enumerate(media_projects, start=1):
+            out_path = (
+                output_root / "images" / date.today().isoformat() / f"{media_id}_{scale_label}.png"
+            )
+            console.print(f"[{index}/{total}] Upscaling [bold]{media_id}[/bold]...")
+            try:
+                target = await client.upsample_image(
+                    media_id=media_id,
+                    project_id=project_id,
+                    target_resolution=resolution,
+                    out_path=out_path,
+                )
+            except GFlowError as exc:
+                failures.append(media_id)
+                console.print(f"[red]Failed:[/red] {media_id}: {exc.title}")
+                continue
+            saved.append(str(target))
+            console.print(f"[bold green]Saved:[/bold green] {safe_path_text(target)}")
+
+    console.print(f"Upscale batch: {len(saved)}/{total} saved")
+    if failures:
+        raise BatchPartialError(
+            detail=f"{len(saved)}/{total} saved; failed media IDs: {', '.join(failures)}",
+            route="image_upscale",
+            partial_results=tuple(saved),
+            remediation_hint=(
+                "Retry failed media IDs after checking their Flow project and account tier."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

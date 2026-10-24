@@ -92,6 +92,7 @@ def fake_page(
     tile: bool = True,
     download: bool = True,
     captured_b64: str | None = None,
+    captured_status: int = 200,
 ) -> MagicMock:
     """A page whose tile/download/menu lookups are driven by the arguments.
 
@@ -104,6 +105,8 @@ def fake_page(
     page.wait_for_timeout = AsyncMock()
     handlers: list[Callable[[Any], Awaitable[None]]] = []
     page.response_handlers = handlers
+    page._sprcad_body = None
+    page._sprcad_status = captured_status
 
     def _on(event: str, handler: Callable[[Any], Awaitable[None]]) -> None:
         if event == "response":
@@ -117,9 +120,22 @@ def fake_page(
     page.remove_listener = MagicMock(side_effect=_off)
 
     async def _evaluate(expr: str, *_: Any) -> Any:
+        if "window.__gflowUpscaleCapture" in expr:
+            if "window.fetch" in expr:
+                page._sprcad_body = None  # a fresh capture starts with no stale response
+                return None
+            if "body" in expr and "http_status" in expr:
+                return {"http_status": page._sprcad_status, "body": page._sprcad_body}
+            return None
         return captured_b64 if "window._videoCapturedBase64" in expr else None
 
     page.evaluate = AsyncMock(side_effect=_evaluate)
+
+    async def _wait_for_function(expr: str, **_: Any) -> None:
+        if page._sprcad_body is None:
+            raise PlaywrightTimeoutError("no captured SPrCad reply")
+
+    page.wait_for_function = AsyncMock(side_effect=_wait_for_function)
 
     async def _wait_for_selector(sel: str, **_: Any) -> Any:
         # #957: the grid re-renders after it is found, so a handle resolved once is
@@ -144,9 +160,21 @@ def fake_page(
     return page
 
 
-async def emit_response(page: MagicMock, body: str, *, rpcid: str) -> None:
+async def emit_response(
+    page: MagicMock,
+    body: str,
+    *,
+    rpcid: str,
+    text_error: str | None = None,
+) -> None:
+    if rpcid == "SPrCad":
+        page._sprcad_body = body
     res = MagicMock()
     res.url = f"{BATCHEXECUTE_URL}?rpcids={rpcid}"
-    res.text = AsyncMock(return_value=body)
+    res.text = (
+        AsyncMock(side_effect=RuntimeError(text_error))
+        if text_error
+        else AsyncMock(return_value=body)
+    )
     for handler in list(page.response_handlers):
         await handler(res)

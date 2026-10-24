@@ -126,6 +126,152 @@ def test_upscale_bad_media_id_rejected_before_client(runner: CliRunner) -> None:
     fake_client.assert_not_called()
 
 
+_MEDIA_ID_2 = "312496cb-7633-45c5-8e42-8ad1921c5c68"
+_PROJECT_ID_2 = "a5636753-8d21-4c2e-8a5e-d5414d74cffc"
+
+
+@pytest.mark.parametrize(
+    "ids_argument",
+    [
+        f"{_MEDIA_ID},{_MEDIA_ID_2}",
+        f'["{_MEDIA_ID}", "{_MEDIA_ID_2}"]',
+    ],
+)
+def test_upscale_batch_positional_string_or_array(
+    runner: CliRunner, tmp_path: Path, ids_argument: str
+) -> None:
+    client = _mock_client(tmp_path / "2k.jpg")
+    result = _invoke(
+        runner,
+        ["image", "upscale", ids_argument, "--scale", "2k", "--project", _PROJECT_ID],
+        client=client,
+        tmp_path=tmp_path,
+    )
+    assert result.exit_code == 0, result.output
+    assert client.__aenter__.await_count == 1
+    assert client.upsample_image.await_count == 2
+    calls = client.upsample_image.await_args_list
+    assert [c.kwargs["media_id"] for c in calls] == [_MEDIA_ID, _MEDIA_ID_2]
+    assert all(c.kwargs["project_id"] == _PROJECT_ID for c in calls)
+    assert calls[0].kwargs["out_path"] != calls[1].kwargs["out_path"]
+    assert "2/2" in result.output
+
+
+@pytest.mark.parametrize(
+    "ids_argument,expected",
+    [
+        (_MEDIA_ID, 1),
+        (f'["{_MEDIA_ID}", "{_MEDIA_ID_2}"]', 2),
+        (f"{_MEDIA_ID},{_MEDIA_ID_2}", 2),
+    ],
+)
+def test_upscale_media_ids_option(
+    runner: CliRunner, tmp_path: Path, ids_argument: str, expected: int
+) -> None:
+    client = _mock_client(tmp_path / "2k.jpg")
+    result = _invoke(
+        runner,
+        [
+            "image",
+            "upscale",
+            "--media-ids",
+            ids_argument,
+            "--scale",
+            "2k",
+            "--project",
+            _PROJECT_ID,
+        ],
+        client=client,
+        tmp_path=tmp_path,
+    )
+    assert result.exit_code == 0, result.output
+    assert client.upsample_image.await_count == expected
+
+
+def test_upscale_batch_per_media_catalog_projects(runner: CliRunner, tmp_path: Path) -> None:
+    client = _mock_client(tmp_path / "2k.jpg")
+    with patch(
+        "gflow_cli.cli_image._resolve_upscale_project_id",
+        side_effect=lambda *, media_id, explicit, profile_name: {
+            _MEDIA_ID: _PROJECT_ID,
+            _MEDIA_ID_2: _PROJECT_ID_2,
+        }[media_id],
+    ):
+        result = _invoke(
+            runner,
+            ["image", "upscale", f"{_MEDIA_ID},{_MEDIA_ID_2}", "--scale", "2k"],
+            client=client,
+            tmp_path=tmp_path,
+        )
+    assert result.exit_code == 0, result.output
+    assert [c.kwargs["project_id"] for c in client.upsample_image.await_args_list] == [
+        _PROJECT_ID,
+        _PROJECT_ID_2,
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad_ids",
+    [
+        f"{_MEDIA_ID},not-a-uuid",
+        f'["{_MEDIA_ID}", null]',
+        f'["{_MEDIA_ID}", "{_MEDIA_ID}"]',
+        "[]",
+        "[invalid json",
+        f"{_MEDIA_ID},",
+    ],
+)
+def test_upscale_batch_invalid_inputs_rejected_before_browser(
+    runner: CliRunner, bad_ids: str
+) -> None:
+    with patch("gflow_cli.cli_image.FlowApiClient") as client:
+        result = _invoke(
+            runner,
+            ["image", "upscale", "--media-ids", bad_ids, "--scale", "2k", "--project", _PROJECT_ID],
+        )
+    assert result.exit_code == 2, result.output
+    client.assert_not_called()
+
+
+def test_upscale_batch_missing_project_rejected_before_browser(runner: CliRunner) -> None:
+    with patch("gflow_cli.cli_image.FlowApiClient") as client:
+        result = _invoke(
+            runner, ["image", "upscale", f"{_MEDIA_ID},{_MEDIA_ID_2}", "--scale", "2k"]
+        )
+    assert result.exit_code == 2, result.output
+    client.assert_not_called()
+
+
+def test_upscale_batch_partial_failure_continues_and_reports_failure(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    client = _mock_client(tmp_path / "2k.jpg")
+    client.upsample_image = AsyncMock(
+        side_effect=[
+            UpscaleUnavailableError(detail="not available", status=403),
+            tmp_path / "2k.jpg",
+        ]
+    )
+    result = _invoke(
+        runner,
+        [
+            "image",
+            "upscale",
+            f"{_MEDIA_ID},{_MEDIA_ID_2}",
+            "--scale",
+            "4k",
+            "--project",
+            _PROJECT_ID,
+        ],
+        client=client,
+        tmp_path=tmp_path,
+    )
+    assert result.exit_code != 0, result.output
+    assert client.upsample_image.await_count == 2
+    assert "1/2" in result.output
+    assert _MEDIA_ID_2 in result.output
+
+
 def test_upscale_4k_unavailable_maps_exit_22(runner: CliRunner, tmp_path: Path) -> None:
     client = _mock_client(tmp_path / "x.png")
     client.upsample_image = AsyncMock(

@@ -73,6 +73,42 @@ def test_menu_token_pattern_matches_whole_token(token: str, text: str, matches: 
     assert bool(menu_token_pattern(token).search(text)) is matches
 
 
+async def test_migrated_upscale_browser_capture_survives_unreadable_cdp_body() -> None:
+    """A successful in-page fetch clone must win even when CDP cannot read that response."""
+    holder: list = []
+
+    async def respond() -> None:
+        await emit_response(
+            holder[0],
+            _make_sprcad_body(_PNG_B64),
+            rpcid="SPrCad",
+            text_error="Protocol error (Network.getResponseBody): No data found",
+        )
+
+    item = FakeItem("2K", on_click=respond)
+    page = fake_page([item])
+    holder.append(page)
+    assert await _run(page) == _PNG_BYTES
+    assert item.clicked
+
+
+async def test_migrated_upscale_capture_refuses_non_200_response() -> None:
+    item, holder = _replying_item("2K", _make_sprcad_body(_PNG_B64))
+    page = fake_page([item], captured_status=502)
+    holder.append(page)
+    with pytest.raises(WireFormatError, match="HTTP 502"):
+        await _run(page)
+
+
+async def test_migrated_upscale_capture_cleanup_even_on_invalid_reply() -> None:
+    item, holder = _replying_item("2K", "not an SPrCad frame")
+    page = fake_page([item])
+    holder.append(page)
+    with pytest.raises(WireFormatError, match="did not contain.*SPrCad"):
+        await _run(page)
+    assert any("__gflowUpscaleCapture" in str(call) for call in page.evaluate.await_args_list)
+
+
 async def test_migrated_upscale_2k_happy_path() -> None:
     item_2k, holder = _replying_item("2K", _make_sprcad_body(_PNG_B64))
     page = fake_page([FakeItem("1K"), item_2k, FakeItem("4K", disabled=True)])
